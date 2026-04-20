@@ -1,23 +1,22 @@
-# Use Playwright v1.50.0 with noble (Ubuntu 24.04)
+# Usar imagem oficial do Playwright que já tem Chromium + dependências
 FROM mcr.microsoft.com/playwright:v1.50.0-noble
 
 WORKDIR /app
 
-# Copy package files first for better caching
-COPY package*.json ./
-COPY tsconfig.json ./
+# Instalar noVNC, x11vnc, xvfb, websockify
+RUN apt-get update && apt-get install -y \
+    x11vnc \
+    xvfb \
+    novnc \
+    websockify \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
+COPY package.json ./
 RUN npm install
 
-# Copy source code
-COPY . .
+COPY server.js ./
 
-# Build TypeScript
-RUN npm run build
+EXPOSE 3000
 
-# Set environment variables
-ENV NODE_ENV=production
-
-# Start the application
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
