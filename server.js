@@ -5,6 +5,9 @@ const express = require('express');
 const { execSync, spawn } = require('child_process');
 const cors = require('cors');
 const crypto = require('crypto');
+const http = require('http');
+const net = require('net');
+const path = require('path');
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
@@ -16,7 +19,7 @@ app.use(cors());
 
 const SECRET = process.env.SERVICE_SECRET;
 const BASE_PORT_VNC = 5900;
-const BASE_PORT_NOVNC = 6080;
+const BASE_PORT_WS  = 6080; // websockify WebSocket port (no HTTP, raw WS)
 
 const sessions = {};
 
@@ -30,10 +33,11 @@ function auth(req, res, next) {
 
 function getPorts(profileId) {
   const hash = parseInt(crypto.createHash('md5').update(profileId).digest('hex').slice(0, 4), 16);
-  const display = 10 + (hash % 50);
-  const vncPort = BASE_PORT_VNC + (hash % 50);
-  const noVncPort = BASE_PORT_NOVNC + (hash % 50);
-  return { display, vncPort, noVncPort };
+  const slot = hash % 50;
+  const display  = 10 + slot;
+  const vncPort  = BASE_PORT_VNC + slot;
+  const wsPort   = BASE_PORT_WS  + slot;
+  return { display, vncPort, wsPort };
 }
 
 function parseProxy(proxyRaw) {
@@ -43,6 +47,47 @@ function parseProxy(proxyRaw) {
   if (parts.length === 4) return { host: parts[0], port: parts[1], user: parts[2], pass: parts[3] };
   return null;
 }
+
+// noVNC static files installed via apt-get into /usr/share/novnc
+const noVncPath = '/usr/share/novnc';
+app.use('/novnc-static', express.static(noVncPath));
+console.log('noVNC static files served from', noVncPath);
+
+// noVNC viewer page for a specific profile
+app.get('/novnc/:profileId', (req, res) => {
+  const session = sessions[req.params.profileId];
+  if (!session) return res.status(404).send('Session not found or not started yet.');
+
+  const proto = req.headers['x-forwarded-proto'] || 'wss';
+  const host  = req.headers.host || 'localhost';
+  // WebSocket connects back to this same server via /ws/:profileId
+  const wsUrl = `wss://${host}/ws/${req.params.profileId}`;
+
+  // Inline noVNC viewer HTML
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Browser - ${req.params.profileId}</title>
+  <style>
+    body { margin: 0; background: #1a1a1a; overflow: hidden; }
+    #screen { width: 100vw; height: 100vh; }
+  </style>
+  <script type="module">
+    import RFB from '/novnc-static/core/rfb.js';
+    const rfb = new RFB(document.getElementById('screen'), '${wsUrl}', {
+      scaleViewport: true,
+      resizeSession: true,
+    });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = true;
+  </script>
+</head>
+<body>
+  <div id="screen"></div>
+</body>
+</html>`);
+});
 
 // Start a browser session
 app.post('/session/start', auth, async (req, res) => {
@@ -55,7 +100,7 @@ app.post('/session/start', auth, async (req, res) => {
     await new Promise(r => setTimeout(r, 500));
   }
 
-  const { display, vncPort, noVncPort } = getPorts(profileId);
+  const { display, vncPort, wsPort } = getPorts(profileId);
   const proxy = parseProxy(proxyRaw);
 
   // Start Xvfb
@@ -63,19 +108,16 @@ app.post('/session/start', auth, async (req, res) => {
     detached: false, stdio: 'ignore'
   });
 
-  await new Promise(r => setTimeout(r, 800));
+  await new Promise(r => setTimeout(r, 1000));
 
   try {
     const env = { ...process.env, DISPLAY: `:${display}`, TZ: timezone || 'America/Sao_Paulo' };
 
-    // Launch browser with playwright-extra + stealth
-    // Detect chromium executable path dynamically
+    // Detect chromium path dynamically
     let chromiumPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
     if (!chromiumPath) {
-      const { execSync: es } = require('child_process');
       try {
-        // Try to find any chromium installed by playwright
-        const found = es('find /ms-playwright -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
+        const found = execSync('find /ms-playwright -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
         chromiumPath = found || undefined;
       } catch (e) {
         chromiumPath = undefined;
@@ -93,7 +135,6 @@ app.post('/session/start', auth, async (req, res) => {
         '--disable-blink-features=AutomationControlled',
         `--lang=${language || 'pt-BR'}`,
         '--window-size=1280,720',
-        '--start-maximized',
       ],
     };
 
@@ -117,49 +158,113 @@ app.post('/session/start', auth, async (req, res) => {
 
     const context = await browser.newContext(contextOptions);
 
-    // Inject cookies if provided
     if (cookies) {
       try {
         const decoded = Buffer.from(cookies, 'base64').toString('utf-8');
-        const cookieList = JSON.parse(decoded);
-        await context.addCookies(cookieList);
+        await context.addCookies(JSON.parse(decoded));
       } catch (e) {
         console.error('Cookie injection failed:', e.message);
       }
     }
 
     const page = await context.newPage();
+
+    // Apply fingerprint spoofing via initScript
+    const cSeed = parseInt((canvasSeed || 'a1b2c3d4').replace(/[^0-9a-f]/gi, '').slice(0, 8), 16) || 123456;
+    const wSeed = parseInt((webglSeed || 'e5f6a7b8').replace(/[^0-9a-f]/gi, '').slice(0, 8), 16) || 654321;
+
+    await context.addInitScript(({ cSeed, wSeed }) => {
+      // ── Canvas fingerprint ──────────────────────────────────────────
+      const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function(type, ...args) {
+        const ctx = this.getContext('2d');
+        if (ctx) {
+          const imgData = ctx.getImageData(0, 0, this.width || 1, this.height || 1);
+          for (let i = 0; i < imgData.data.length; i += 4) {
+            imgData.data[i]     = (imgData.data[i]     + (cSeed & 0xff)) & 0xff;
+            imgData.data[i + 1] = (imgData.data[i + 1] + ((cSeed >> 8) & 0xff)) & 0xff;
+          }
+          ctx.putImageData(imgData, 0, 0);
+        }
+        return origToDataURL.call(this, type, ...args);
+      };
+
+      const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function(...args) {
+        const data = origGetImageData.apply(this, args);
+        for (let i = 0; i < data.data.length; i += 4) {
+          data.data[i] = (data.data[i] + (cSeed & 0x03)) & 0xff;
+        }
+        return data;
+      };
+
+      // ── WebGL fingerprint ───────────────────────────────────────────
+      const origGetParam = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Google Inc. (spoofed)';  // UNMASKED_VENDOR
+        if (param === 37446) return `ANGLE (NVIDIA, Renderer-${wSeed & 0xffff})`;  // UNMASKED_RENDERER
+        return origGetParam.call(this, param);
+      };
+      const origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
+      WebGL2RenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Google Inc. (spoofed)';
+        if (param === 37446) return `ANGLE (NVIDIA, Renderer-${wSeed & 0xffff})`;
+        return origGetParam2.call(this, param);
+      };
+
+      // ── Hardware concurrency (CPU cores) ───────────────────────────
+      const cores = [2, 4, 4, 8, 8, 8, 16][(cSeed % 7)];
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => cores });
+
+      // ── Device memory ───────────────────────────────────────────────
+      const mem = [2, 4, 4, 8, 8][(wSeed % 5)];
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => mem });
+
+      // ── WebRTC leak protection ──────────────────────────────────────
+      if (window.RTCPeerConnection) {
+        const OrigRTC = window.RTCPeerConnection;
+        window.RTCPeerConnection = function(config, ...rest) {
+          const filteredConfig = config ? {
+            ...config,
+            iceServers: [],
+            iceTransportPolicy: 'relay',
+          } : { iceServers: [], iceTransportPolicy: 'relay' };
+          return new OrigRTC(filteredConfig, ...rest);
+        };
+        window.RTCPeerConnection.prototype = OrigRTC.prototype;
+      }
+
+    }, { cSeed, wSeed });
+
     await page.goto('about:blank');
 
-    // Start x11vnc
+    // Start x11vnc (raw VNC, no password)
     const vncProcess = spawn('x11vnc', [
       '-display', `:${display}`,
       '-forever', '-shared',
       '-rfbport', String(vncPort),
-      '-nopw', '-quiet'
+      '-nopw', '-quiet', '-bg'
     ], { detached: false, stdio: 'ignore' });
 
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 1500));
 
-    // Start noVNC websockify
-    const noVncProcess = spawn('websockify', [
-      '--web', '/usr/share/novnc/',
-      String(noVncPort),
+    // Start websockify: WebSocket on wsPort → VNC on vncPort
+    const wsProcess = spawn('websockify', [
+      String(wsPort),
       `localhost:${vncPort}`
     ], { detached: false, stdio: 'ignore' });
 
+    await new Promise(r => setTimeout(r, 500));
+
     sessions[profileId] = {
-      display, vncPort, noVncPort,
+      display, vncPort, wsPort,
       browser, context, page,
-      xvfbProcess, vncProcess, noVncProcess,
+      xvfbProcess, vncProcess, wsProcess,
       startedAt: new Date().toISOString()
     };
 
-    const proto = req.headers['x-forwarded-proto'] || 'https';
-    const host = (req.headers.host || 'localhost').split(':')[0];
-    // Use the Railway public domain (no port) with the reverse-proxy path
-    const railwayHost = process.env.RAILWAY_PUBLIC_DOMAIN || host;
-    const noVncUrl = `https://${railwayHost}/novnc/${profileId}/vnc.html?autoconnect=true&resize=scale&reconnect=true`;
+    const railwayHost = process.env.RAILWAY_PUBLIC_DOMAIN || req.headers.host || 'localhost';
+    const noVncUrl = `https://${railwayHost}/novnc/${profileId}`;
 
     res.json({ success: true, profileId, noVncUrl });
 
@@ -178,40 +283,17 @@ app.post('/session/stop', auth, async (req, res) => {
 });
 
 // Status
-app.get('/session/:profileId', auth, (req, res) => {
+app.get('/session/:profileId/status', auth, (req, res) => {
   const session = sessions[req.params.profileId];
   if (!session) return res.json({ active: false });
   res.json({ active: true, profileId: req.params.profileId, startedAt: session.startedAt });
-});
-
-// noVNC static files served directly
-app.use('/novnc-static', require('express').static('/usr/share/novnc/'));
-
-// noVNC reverse proxy via http-proxy
-const { createProxyMiddleware } = require('http-proxy-middleware');
-
-app.use('/novnc/:profileId', (req, res, next) => {
-  const session = sessions[req.params.profileId];
-  if (!session) return res.status(404).send('Session not found');
-
-  // Strip /novnc/:profileId prefix and proxy to local noVNC port
-  req.url = req.url.replace(`/novnc/${req.params.profileId}`, '') || '/';
-
-  const proxy = createProxyMiddleware({
-    target: `http://localhost:${session.noVncPort}`,
-    ws: true,
-    changeOrigin: true,
-    logLevel: 'silent',
-  });
-
-  proxy(req, res, next);
 });
 
 function killSession(profileId) {
   const s = sessions[profileId];
   if (!s) return;
   try { s.browser?.close(); } catch (e) {}
-  try { s.noVncProcess?.kill('SIGKILL'); } catch (e) {}
+  try { s.wsProcess?.kill('SIGKILL'); } catch (e) {}
   try { s.vncProcess?.kill('SIGKILL'); } catch (e) {}
   try { s.xvfbProcess?.kill('SIGKILL'); } catch (e) {}
   try { execSync(`pkill -f "Xvfb :${s.display}"`, { stdio: 'ignore' }); } catch (e) {}
@@ -220,24 +302,33 @@ function killSession(profileId) {
 
 app.get('/health', (req, res) => res.json({ ok: true, sessions: Object.keys(sessions).length }));
 
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log(`ProfileVault Browser Server on port ${PORT}`));
+// ── HTTP server + WebSocket tunnel ──────────────────────────────────────────
+const server = http.createServer(app);
 
-// Forward WebSocket upgrades to the correct noVNC session
+// Proxy WebSocket upgrades at /ws/:profileId → local websockify port
 server.on('upgrade', (req, socket, head) => {
-  const match = req.url.match(/^\/novnc\/([^/]+)/);
-  if (!match) return socket.destroy();
+  const match = req.url.match(/^\/ws\/([^/?]+)/);
+  if (!match) { socket.destroy(); return; }
+
   const profileId = match[1];
   const session = sessions[profileId];
-  if (!session) return socket.destroy();
+  if (!session) { socket.destroy(); return; }
 
-  const { createProxyMiddleware } = require('http-proxy-middleware');
-  const wsProxy = createProxyMiddleware({
-    target: `http://localhost:${session.noVncPort}`,
-    ws: true,
-    changeOrigin: true,
-    logLevel: 'silent',
+  const target = net.createConnection(session.wsPort, 'localhost', () => {
+    // Send HTTP upgrade response manually, then pipe raw TCP
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n\r\n'
+    );
+    target.write(head);
+    target.pipe(socket);
+    socket.pipe(target);
   });
 
-  wsProxy.upgrade(req, socket, head);
+  target.on('error', () => socket.destroy());
+  socket.on('error', () => target.destroy());
 });
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`ProfileVault Browser Server on port ${PORT}`));
