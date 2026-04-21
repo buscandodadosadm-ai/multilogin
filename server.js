@@ -148,7 +148,7 @@ app.post('/session/start', auth, async (req, res) => {
     console.log('🌐 Abrindo browser...');
 
     const context = await chromium.launchPersistentContext(profilePath, {
-      headless: false, // obrigatório para extensão
+      headless: true, // obrigatório para extensão
       viewport: { width: 1280, height: 720 },
       userAgent: userAgent || undefined,
       locale: language || 'pt-BR',
