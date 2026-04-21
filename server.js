@@ -46,7 +46,7 @@ function parseProxy(proxyRaw) {
 
 // Start a browser session
 app.post('/session/start', auth, async (req, res) => {
-  const { profileId, proxyRaw, userAgent, timezone, language, canvasSeed, webglSeed, cookies } = req.body;
+  const { profileId, proxyRaw, proxyType, userAgent, timezone, language, canvasSeed, webglSeed, cookies } = req.body;
   if (!profileId) return res.status(400).json({ error: 'profileId required' });
 
   // Kill existing session
@@ -69,9 +69,22 @@ app.post('/session/start', auth, async (req, res) => {
     const env = { ...process.env, DISPLAY: `:${display}`, TZ: timezone || 'America/Sao_Paulo' };
 
     // Launch browser with playwright-extra + stealth
+    // Detect chromium executable path dynamically
+    let chromiumPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+    if (!chromiumPath) {
+      const { execSync: es } = require('child_process');
+      try {
+        // Try to find any chromium installed by playwright
+        const found = es('find /ms-playwright -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
+        chromiumPath = found || undefined;
+      } catch (e) {
+        chromiumPath = undefined;
+      }
+    }
+
     const launchOptions = {
       headless: false,
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/ms-playwright/chromium-1161/chrome-linux/chrome',
+      ...(chromiumPath ? { executablePath: chromiumPath } : {}),
       env,
       args: [
         '--no-sandbox',
@@ -85,7 +98,8 @@ app.post('/session/start', auth, async (req, res) => {
     };
 
     if (proxy) {
-      launchOptions.args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
+      const scheme = proxyType === 'socks5' ? 'socks5' : 'http';
+      launchOptions.args.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);
     }
 
     const browser = await chromium.launch(launchOptions);
