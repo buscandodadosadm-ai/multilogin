@@ -102,7 +102,8 @@ app.post('/session/start', async (req, res) => {
       '-rfbport', String(vncPort),
       '-nopw',
       '-norc',
-      '-xkb'
+      '-xkb',
+      '-noresize'
     ]);
     vnc.on('error', err => console.error(`[x11vnc] erro:`, err));
     vnc.stdout?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
