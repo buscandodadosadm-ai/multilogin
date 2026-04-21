@@ -204,61 +204,6 @@ app.get('/session/:profileId/status', (req, res) => {
   });
 });
 
-// ================= WEBSOCKET PROXY (para noVNC via JS) =================
-const WebSocket = require('ws');
-const wsServer = new WebSocket.Server({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-  if (req.url.startsWith('/ws/')) {
-    wsServer.handleUpgrade(req, socket, head, (ws) => {
-      const profileId = req.url.split('/').pop();
-      const s = sessions[profileId];
-
-      if (!s) {
-        ws.close(1008, 'Session not found');
-        return;
-      }
-
-      console.log(`[WebSocket] Client conectado a ${profileId}`);
-
-      // Conectar ao x11vnc
-      const vncSocket = require('net').createConnection({
-        host: 'localhost',
-        port: s.vncPort
-      });
-
-      vncSocket.on('data', (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
-        }
-      });
-
-      vncSocket.on('error', (err) => {
-        console.error(`[VNC Socket] erro:`, err.message);
-        ws.close(1011, 'VNC connection error');
-      });
-
-      vncSocket.on('close', () => {
-        ws.close(1000);
-      });
-
-      ws.on('message', (data) => {
-        vncSocket.write(data);
-      });
-
-      ws.on('close', () => {
-        vncSocket.destroy();
-        console.log(`[WebSocket] Client desconectado de ${profileId}`);
-      });
-
-      ws.on('error', (err) => {
-        console.error(`[WebSocket] erro:`, err.message);
-        vncSocket.destroy();
-      });
-    });
-  }
-});
-
 // ================= NOVNC HTML PAGE =================
 app.get('/novnc/:profileId', (req, res) => {
   const { profileId } = req.params;
@@ -333,6 +278,61 @@ app.get('/health', (req, res) => {
 // ================= START SERVER =================
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
+
+// ================= WEBSOCKET PROXY (para noVNC via JS) =================
+const WebSocket = require('ws');
+const wsServer = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url.startsWith('/ws/')) {
+    wsServer.handleUpgrade(req, socket, head, (ws) => {
+      const profileId = req.url.split('/').pop();
+      const s = sessions[profileId];
+
+      if (!s) {
+        ws.close(1008, 'Session not found');
+        return;
+      }
+
+      console.log(`[WebSocket] Client conectado a ${profileId}`);
+
+      // Conectar ao x11vnc
+      const vncSocket = require('net').createConnection({
+        host: 'localhost',
+        port: s.vncPort
+      });
+
+      vncSocket.on('data', (data) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data);
+        }
+      });
+
+      vncSocket.on('error', (err) => {
+        console.error(`[VNC Socket] erro:`, err.message);
+        ws.close(1011, 'VNC connection error');
+      });
+
+      vncSocket.on('close', () => {
+        ws.close(1000);
+      });
+
+      ws.on('message', (data) => {
+        vncSocket.write(data);
+      });
+
+      ws.on('close', () => {
+        vncSocket.destroy();
+        console.log(`[WebSocket] Client desconectado de ${profileId}`);
+      });
+
+      ws.on('error', (err) => {
+        console.error(`[WebSocket] erro:`, err.message);
+        vncSocket.destroy();
+      });
+    });
+  }
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 ProfileVault Server rodando na porta ${PORT}`);
