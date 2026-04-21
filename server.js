@@ -12,15 +12,6 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
-// ================= ESTABILIDADE =================
-process.on('uncaughtException', (err) => {
-  console.error('ERRO GLOBAL:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  console.error('PROMISE NÃO TRATADA:', err);
-});
-
 // ================= AUTH =================
 function auth(req, res, next) {
   const key = req.headers['x-service-secret'];
@@ -35,9 +26,7 @@ function parseProxy(proxyRaw, proxyType) {
   if (!proxyRaw) return null;
 
   const parts = proxyRaw.split(':');
-
-  let scheme = 'http';
-  if (proxyType === 'socks5') scheme = 'socks5';
+  let scheme = proxyType === 'socks5' ? 'socks5' : 'http';
 
   if (parts.length === 2) {
     return {
@@ -58,91 +47,67 @@ function parseProxy(proxyRaw, proxyType) {
 
 // ================= START =================
 app.post('/session/start', auth, async (req, res) => {
-  const {
-    profileId,
-    proxyRaw,
-    proxyType,
-    userAgent,
-    cookies,
-    timezone,
-    language
-  } = req.body;
+  const { profileId, proxyRaw, proxyType } = req.body;
 
   if (!profileId) {
     return res.status(400).json({ error: 'profileId required' });
   }
 
   try {
-    // AUTO-KILL
+    // mata sessão antiga
     if (sessions[profileId]) {
-      try {
-        await sessions[profileId].browser.close();
-      } catch {}
+      try { await sessions[profileId].browser.close(); } catch {}
       delete sessions[profileId];
     }
 
     const proxy = parseProxy(proxyRaw, proxyType);
 
-    console.log('==== NOVA SESSÃO ====');
-    console.log('Perfil:', profileId);
+    console.log('=== INICIANDO ===');
     console.log('Proxy:', proxy);
 
-    // 🔥 PROXY NO LAUNCH (CORREÇÃO PRINCIPAL)
     const browser = await chromium.launch({
-      headless: true,
+      headless: false, // 🔥 IMPORTANTE (teste real)
       timeout: 60000,
-      proxy: proxy || undefined
+      proxy: proxy || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--ignore-certificate-errors',
+        '--ignore-certificate-errors-spki-list'
+      ]
     });
 
     const context = await browser.newContext({
-      userAgent: userAgent || undefined,
-      locale: language || 'pt-BR',
-      timezoneId: timezone || 'America/Sao_Paulo',
-      viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true
     });
 
-    if (cookies && Array.isArray(cookies)) {
-      try {
-        await context.addCookies(cookies);
-      } catch (e) {
-        console.log('Erro cookies:', e.message);
-      }
-    }
-
     const page = await context.newPage();
 
-    // TESTE CONEXÃO
+    // teste básico
     await page.goto('http://example.com', {
       timeout: 60000,
-      waitUntil: 'commit'
+      waitUntil: 'domcontentloaded'
     });
 
-    console.log('Navegação OK');
+    console.log('Página abriu');
 
-    // TESTE IP
+    // teste IP
     try {
-      const ipCheck = await page.goto('http://api.ipify.org?format=json');
-      const body = await ipCheck.text();
+      const resp = await page.goto('http://api.ipify.org?format=json');
+      const body = await resp.text();
       console.log('IP:', body);
     } catch (e) {
       console.log('Erro IP:', e.message);
     }
 
-    sessions[profileId] = {
-      browser,
-      context,
-      page,
-      startedAt: new Date().toISOString()
-    };
+    sessions[profileId] = { browser };
 
-    res.json({
-      success: true,
-      profileId
-    });
+    res.json({ success: true });
 
   } catch (error) {
-    console.error('ERRO:', error);
+    console.error('ERRO REAL:', error);
 
     res.status(500).json({
       error: error.message
@@ -154,26 +119,22 @@ app.post('/session/start', auth, async (req, res) => {
 app.post('/session/stop', auth, async (req, res) => {
   const { profileId } = req.body;
 
-  const session = sessions[profileId];
-  if (!session) return res.json({ success: false });
-
-  try {
-    await session.browser.close();
-  } catch {}
-
-  delete sessions[profileId];
+  if (sessions[profileId]) {
+    try { await sessions[profileId].browser.close(); } catch {}
+    delete sessions[profileId];
+  }
 
   res.json({ success: true });
 });
 
 // ================= HEALTH =================
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  res.send('OK');
 });
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor rodando na porta', PORT);
+  console.log('Servidor rodando...');
 });
