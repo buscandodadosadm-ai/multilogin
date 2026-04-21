@@ -54,7 +54,7 @@ app.post('/session/start', async (req, res) => {
 
     const { display, vncPort, wsPort } = getPorts(profileId);
 
-    console.log('🚀 START SESSION:', profileId);
+    console.log(`🚀 START SESSION: ${profileId} (display :${display}, VNC ${vncPort}, WS ${wsPort})`);
 
     // 1. Xvfb
     const xvfb = spawn('Xvfb', [
@@ -64,13 +64,16 @@ app.post('/session/start', async (req, res) => {
       '1280x720x24',
       '-ac'
     ]);
+    xvfb.on('error', err => console.error(`[Xvfb] erro:`, err));
+    xvfb.stderr?.on('data', d => console.log(`[Xvfb stderr]`, d.toString()));
 
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 2000));
 
     // 2. Fluxbox
     const fluxbox = spawn('fluxbox', [], {
       env: { ...process.env, DISPLAY: `:${display}` }
     });
+    fluxbox.on('error', err => console.error(`[Fluxbox] erro:`, err));
 
     // 3. Chromium
     const chrome = spawn('chromium', [
@@ -81,8 +84,9 @@ app.post('/session/start', async (req, res) => {
     ], {
       env: { ...process.env, DISPLAY: `:${display}` }
     });
+    chrome.on('error', err => console.error(`[Chrome] erro:`, err));
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
 
     // 4. VNC
     const vnc = spawn('x11vnc', [
@@ -90,24 +94,19 @@ app.post('/session/start', async (req, res) => {
       '-forever',
       '-shared',
       '-rfbport', String(vncPort),
-      '-nopw'
+      '-nopw',
+      '-norc'
     ]);
-
-    await new Promise(r => setTimeout(r, 1500));
-
-    // 5. WebSocket interno
-    const ws = spawn('websockify', [
-      String(wsPort),
-      `localhost:${vncPort}`
-    ]);
+    vnc.on('error', err => console.error(`[x11vnc] erro:`, err));
+    vnc.stdout?.on('data', d => console.log(`[x11vnc stdout]`, d.toString().slice(0, 100)));
+    vnc.stderr?.on('data', d => console.log(`[x11vnc stderr]`, d.toString().slice(0, 100)));
 
     sessions[profileId] = {
       xvfb,
       fluxbox,
       chrome,
       vnc,
-      ws,
-      wsPort
+      vncPort
     };
 
     const protocol = req.headers['x-forwarded-proto'] || 'https';
@@ -133,7 +132,6 @@ app.post('/session/stop', async (req, res) => {
 
   try { s.chrome.kill(); } catch {}
   try { s.vnc.kill(); } catch {}
-  try { s.ws.kill(); } catch {}
   try { s.fluxbox.kill(); } catch {}
   try { s.xvfb.kill(); } catch {}
 
@@ -200,15 +198,22 @@ server.on('upgrade', (req, socket, head) => {
   const session = sessions[profileId];
 
   if (!session) {
-    socket.destroy();
+    console.error(`[WS] Sessão não encontrada: ${profileId}`);
+    socket.writeHead(404);
+    socket.end();
     return;
   }
 
-  const target = net.createConnection(session.wsPort, '127.0.0.1', () => {
+  console.log(`[WS] Conectando ${profileId} para VNC porta ${session.vncPort}`);
+
+  const target = net.createConnection(session.vncPort, '127.0.0.1', () => {
+    console.log(`[WS] VNC conectado! Upgrading protocol...`);
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
       'Upgrade: websocket\r\n' +
-      'Connection: Upgrade\r\n\r\n'
+      'Connection: Upgrade\r\n' +
+      'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n' +
+      '\r\n'
     );
 
     target.write(head);
@@ -216,8 +221,15 @@ server.on('upgrade', (req, socket, head) => {
     socket.pipe(target);
   });
 
-  target.on('error', () => socket.destroy());
-  socket.on('error', () => target.destroy());
+  target.on('error', (err) => {
+    console.error(`[WS] Erro VNC:`, err.message);
+    socket.writeHead(500);
+    socket.end('Connection error');
+  });
+  socket.on('error', (err) => {
+    console.error(`[WS] Erro socket:`, err.message);
+    target.destroy();
+  });
 });
 
 // ================= START =================
