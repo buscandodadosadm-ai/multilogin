@@ -46,8 +46,10 @@ app.post('/session/start', async (req, res) => {
       '-listen', 'tcp'
     ]);
     xvfb.on('error', err => console.error(`[Xvfb] erro:`, err));
+    xvfb.stdout?.on('data', d => console.log(`[Xvfb]`, d.toString().trim()));
+    xvfb.stderr?.on('data', d => console.log(`[Xvfb ERROR]`, d.toString().trim()));
 
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 2000));
 
     // 2. Fluxbox (window manager)
     console.log(`[2] Iniciando Fluxbox...`);
@@ -55,6 +57,8 @@ app.post('/session/start', async (req, res) => {
       env: { ...process.env, DISPLAY: display }
     });
     fluxbox.on('error', err => console.error(`[Fluxbox] erro:`, err));
+    fluxbox.stdout?.on('data', d => console.log(`[Fluxbox]`, d.toString().trim()));
+    fluxbox.stderr?.on('data', d => console.log(`[Fluxbox ERROR]`, d.toString().trim()));
 
     // 3. Chromium
     console.log(`[3] Iniciando Chromium...`);
@@ -88,10 +92,10 @@ app.post('/session/start', async (req, res) => {
       env: { ...process.env, DISPLAY: display }
     });
     chrome.on('error', err => console.error(`[Chromium] erro:`, err));
-    chrome.stdout?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
-    chrome.stderr?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
+    chrome.stdout?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 120)));
+    chrome.stderr?.on('data', d => console.log(`[Chromium ERROR]`, d.toString().slice(0, 120)));
 
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 6000));
 
     // 4. x11vnc
     console.log(`[4] Iniciando x11vnc na porta ${vncPort}...`);
@@ -103,11 +107,12 @@ app.post('/session/start', async (req, res) => {
       '-nopw',
       '-norc',
       '-xkb',
-      '-noresize'
+      '-noresize',
+      '-verbose'
     ]);
     vnc.on('error', err => console.error(`[x11vnc] erro:`, err));
-    vnc.stdout?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
-    vnc.stderr?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
+    vnc.stdout?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 120)));
+    vnc.stderr?.on('data', d => console.log(`[x11vnc ERROR]`, d.toString().slice(0, 120)));
 
     // Esperar x11vnc estar pronto
     await new Promise(r => setTimeout(r, 4000));
