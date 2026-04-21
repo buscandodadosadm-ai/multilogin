@@ -12,13 +12,13 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
-// ================= LOG GLOBAL =================
+// ================= DEBUG GLOBAL =================
 process.on('uncaughtException', (err) => {
-  console.error('ERRO GLOBAL:', err);
+  console.error('🔥 ERRO GLOBAL:', err);
 });
 
 process.on('unhandledRejection', (err) => {
-  console.error('PROMISE NÃO TRATADA:', err);
+  console.error('🔥 PROMISE NÃO TRATADA:', err);
 });
 
 // ================= AUTH =================
@@ -52,26 +52,31 @@ function parseProxy(proxyRaw, proxyType) {
   return null;
 }
 
-// ================= START SESSION =================
+// ================= START =================
 app.post('/session/start', auth, async (req, res) => {
   const { profileId, proxyRaw, proxyType } = req.body;
 
-  console.log('==== START SESSION ====');
+  console.log('\n==============================');
+  console.log('🚀 NOVA SESSÃO');
   console.log(req.body);
-
-  if (!profileId) {
-    return res.status(400).json({ error: 'profileId required' });
-  }
+  console.log('==============================\n');
 
   try {
+    if (!profileId) {
+      throw new Error('profileId não enviado');
+    }
+
     const proxy = parseProxy(proxyRaw, proxyType);
     console.log('Proxy:', proxy);
 
-    // encerra sessão existente
+    // matar sessão antiga
     if (sessions[profileId]) {
+      console.log('Encerrando sessão anterior...');
       try { await sessions[profileId].browser.close(); } catch {}
       delete sessions[profileId];
     }
+
+    console.log('1️⃣ Launch browser...');
 
     const browser = await chromium.launch({
       headless: true,
@@ -85,56 +90,55 @@ app.post('/session/start', auth, async (req, res) => {
       ]
     });
 
+    console.log('2️⃣ Browser OK');
+
     const context = await browser.newContext({
       ignoreHTTPSErrors: true
     });
 
+    console.log('3️⃣ Context OK');
+
     const page = await context.newPage();
+
+    console.log('4️⃣ Page OK');
 
     await page.goto('http://example.com', {
       timeout: 60000,
       waitUntil: 'commit'
     });
 
-    console.log('Navegação OK');
+    console.log('5️⃣ Navegação OK');
 
     // teste IP
     try {
       const resp = await page.goto('http://api.ipify.org?format=json');
       const body = await resp.text();
-      console.log('IP:', body);
+      console.log('🌍 IP:', body);
     } catch (e) {
-      console.log('Erro ao validar IP:', e.message);
+      console.log('⚠️ Erro ao pegar IP:', e.message);
     }
 
     sessions[profileId] = { browser };
 
-    res.json({ success: true, profileId });
+    res.json({
+      success: true,
+      message: 'Sessão iniciada com sucesso'
+    });
 
   } catch (error) {
-    console.error('ERRO AO INICIAR:', error);
+    console.error('❌ ERRO REAL DETALHADO:\n', error);
 
     res.status(500).json({
-      error: error.message
+      success: false,
+      error: error.message,
+      stack: error.stack
     });
   }
 });
 
-// ================= STOP =================
-app.post('/session/stop', auth, async (req, res) => {
-  const { profileId } = req.body;
-
-  if (sessions[profileId]) {
-    try { await sessions[profileId].browser.close(); } catch {}
-    delete sessions[profileId];
-  }
-
-  res.json({ success: true });
-});
-
 // ================= HEALTH =================
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  res.send('OK');
 });
 
 // ================= START SERVER =================
