@@ -71,7 +71,7 @@ app.post('/session/start', auth, async (req, res) => {
     // Launch browser with playwright-extra + stealth
     const launchOptions = {
       headless: false,
-      executablePath: '/usr/bin/chromium-browser',
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/ms-playwright/chromium-1161/chrome-linux/chrome',
       env,
       args: [
         '--no-sandbox',
