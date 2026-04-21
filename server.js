@@ -59,12 +59,9 @@ app.post('/session/start', async (req, res) => {
     // 3. Chromium
     console.log(`[3] Iniciando Chromium...`);
     const chromeArgs = [
-      '--headless=new',
       '--no-sandbox',
       '--disable-gpu',
       '--disable-dev-shm-usage',
-      '--single-process',
-      `--display=${display}`,
       '--window-size=1920,1080',
       '--disable-blink-features=AutomationControlled',
       'about:blank'
