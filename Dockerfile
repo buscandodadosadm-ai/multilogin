@@ -2,21 +2,31 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
+# Instalar dependências do Playwright
 RUN apt-get update && apt-get install -y \
-    chromium \
-    x11vnc \
-    xvfb \
-    novnc \
-    websockify \
+    wget \
+    ca-certificates \
+    fonts-liberation \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libgtk-3-0 \
+    libxshmfence1 \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+# Instalar browsers do Playwright
+RUN npx playwright install --with-deps
 
 COPY package.json ./
 RUN npm install
 
-COPY server.js ./
+COPY . .
 
 EXPOSE 3000
 
