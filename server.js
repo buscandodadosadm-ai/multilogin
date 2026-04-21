@@ -8,10 +8,6 @@ const crypto = require('crypto');
 const http = require('http');
 const net = require('net');
 const path = require('path');
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-chromium.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
@@ -19,7 +15,7 @@ app.use(cors());
 
 const SECRET = process.env.SERVICE_SECRET;
 const BASE_PORT_VNC = 5900;
-const BASE_PORT_WS  = 6080; // websockify WebSocket port (no HTTP, raw WS)
+const BASE_PORT_WS  = 6080;
 
 const sessions = {};
 
@@ -48,6 +44,28 @@ function parseProxy(proxyRaw) {
   return null;
 }
 
+function findChromium() {
+  const candidates = [
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    try { execSync(`test -f "${c}"`, { stdio: 'ignore' }); return c; } catch (e) {}
+  }
+  // fallback: search ms-playwright
+  try {
+    const found = execSync('find /ms-playwright -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
+    if (found) return found;
+  } catch (e) {}
+  return null;
+}
+
+function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 // noVNC static files installed via apt-get into /usr/share/novnc
 const noVncPath = '/usr/share/novnc';
 app.use('/novnc-static', express.static(noVncPath));
@@ -58,29 +76,33 @@ app.get('/novnc/:profileId', (req, res) => {
   const session = sessions[req.params.profileId];
   if (!session) return res.status(404).send('Session not found or not started yet.');
 
-  const proto = req.headers['x-forwarded-proto'] || 'wss';
-  const host  = req.headers.host || 'localhost';
-  // WebSocket connects back to this same server via /ws/:profileId
+  const host = req.headers.host || 'localhost';
   const wsUrl = `wss://${host}/ws/${req.params.profileId}`;
 
-  // Inline noVNC viewer HTML
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>Browser - ${req.params.profileId}</title>
   <style>
-    body { margin: 0; background: #1a1a1a; overflow: hidden; }
-    #screen { width: 100vw; height: 100vh; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a1a; overflow: hidden; width: 100vw; height: 100vh; }
+    #screen { width: 100%; height: 100%; }
   </style>
   <script type="module">
     import RFB from '/novnc-static/core/rfb.js';
-    const rfb = new RFB(document.getElementById('screen'), '${wsUrl}', {
-      scaleViewport: true,
-      resizeSession: true,
-    });
-    rfb.scaleViewport = true;
-    rfb.resizeSession = true;
+    const screen = document.getElementById('screen');
+    let rfb;
+    function connect() {
+      rfb = new RFB(screen, '${wsUrl}', { credentials: {} });
+      rfb.scaleViewport = true;
+      rfb.resizeSession = false;
+      rfb.addEventListener('disconnect', (e) => {
+        console.log('VNC disconnected, retrying in 2s', e.detail);
+        setTimeout(connect, 2000);
+      });
+    }
+    connect();
   </script>
 </head>
 <body>
@@ -97,169 +119,86 @@ app.post('/session/start', auth, async (req, res) => {
   // Kill existing session
   if (sessions[profileId]) {
     try { killSession(profileId); } catch (e) {}
-    await new Promise(r => setTimeout(r, 500));
+    await wait(800);
   }
 
   const { display, vncPort, wsPort } = getPorts(profileId);
   const proxy = parseProxy(proxyRaw);
 
-  // Start Xvfb
-  const xvfbProcess = spawn('Xvfb', [`:${display}`, '-screen', '0', '1280x720x24'], {
+  // 1. Start Xvfb
+  const xvfbProcess = spawn('Xvfb', [`:${display}`, '-screen', '0', '1280x720x24', '-ac'], {
     detached: false, stdio: 'ignore'
   });
-
-  await new Promise(r => setTimeout(r, 1000));
+  await wait(1500);
 
   try {
-    const env = { ...process.env, DISPLAY: `:${display}`, TZ: timezone || 'America/Sao_Paulo' };
+    // 2. Find Chromium binary
+    const chromiumPath = findChromium();
+    if (!chromiumPath) throw new Error('Chromium not found on this machine');
+    console.log('Using chromium:', chromiumPath);
 
-    // Detect chromium path dynamically
-    let chromiumPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
-    if (!chromiumPath) {
-      try {
-        const found = execSync('find /ms-playwright -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
-        chromiumPath = found || undefined;
-      } catch (e) {
-        chromiumPath = undefined;
-      }
-    }
-
-    const launchOptions = {
-      headless: false,
-      ...(chromiumPath ? { executablePath: chromiumPath } : {}),
-      env,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        `--lang=${language || 'pt-BR'}`,
-        '--window-size=1280,720',
-      ],
-    };
+    // 3. Build Chromium args
+    const chromeArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+      `--lang=${language || 'pt-BR'}`,
+      '--window-size=1280,720',
+      '--window-position=0,0',
+      '--start-maximized',
+      `--user-agent=${userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}`,
+    ];
 
     if (proxy) {
       const scheme = proxyType === 'socks5' ? 'socks5' : 'http';
-      launchOptions.args.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);
+      chromeArgs.push(`--proxy-server=${scheme}://${proxy.host}:${proxy.port}`);
     }
 
-    const browser = await chromium.launch(launchOptions);
+    chromeArgs.push('https://www.google.com');
 
-    const contextOptions = {
-      viewport: { width: 1280, height: 720 },
-      userAgent: userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      locale: language || 'pt-BR',
-      timezoneId: timezone || 'America/Sao_Paulo',
+    const chromeEnv = {
+      ...process.env,
+      DISPLAY: `:${display}`,
+      TZ: timezone || 'America/Sao_Paulo',
     };
 
-    if (proxy && proxy.user && proxy.pass) {
-      contextOptions.httpCredentials = { username: proxy.user, password: proxy.pass };
-    }
+    // 4. Launch Chromium directly (renders in Xvfb display)
+    const chromeProcess = spawn(chromiumPath, chromeArgs, {
+      detached: false,
+      stdio: 'ignore',
+      env: chromeEnv,
+    });
 
-    const context = await browser.newContext(contextOptions);
+    await wait(2000);
 
-    if (cookies) {
-      try {
-        const decoded = Buffer.from(cookies, 'base64').toString('utf-8');
-        await context.addCookies(JSON.parse(decoded));
-      } catch (e) {
-        console.error('Cookie injection failed:', e.message);
-      }
-    }
-
-    const page = await context.newPage();
-
-    // Apply fingerprint spoofing via initScript
-    const cSeed = parseInt((canvasSeed || 'a1b2c3d4').replace(/[^0-9a-f]/gi, '').slice(0, 8), 16) || 123456;
-    const wSeed = parseInt((webglSeed || 'e5f6a7b8').replace(/[^0-9a-f]/gi, '').slice(0, 8), 16) || 654321;
-
-    await context.addInitScript(({ cSeed, wSeed }) => {
-      // ── Canvas fingerprint ──────────────────────────────────────────
-      const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-      HTMLCanvasElement.prototype.toDataURL = function(type, ...args) {
-        const ctx = this.getContext('2d');
-        if (ctx) {
-          const imgData = ctx.getImageData(0, 0, this.width || 1, this.height || 1);
-          for (let i = 0; i < imgData.data.length; i += 4) {
-            imgData.data[i]     = (imgData.data[i]     + (cSeed & 0xff)) & 0xff;
-            imgData.data[i + 1] = (imgData.data[i + 1] + ((cSeed >> 8) & 0xff)) & 0xff;
-          }
-          ctx.putImageData(imgData, 0, 0);
-        }
-        return origToDataURL.call(this, type, ...args);
-      };
-
-      const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-      CanvasRenderingContext2D.prototype.getImageData = function(...args) {
-        const data = origGetImageData.apply(this, args);
-        for (let i = 0; i < data.data.length; i += 4) {
-          data.data[i] = (data.data[i] + (cSeed & 0x03)) & 0xff;
-        }
-        return data;
-      };
-
-      // ── WebGL fingerprint ───────────────────────────────────────────
-      const origGetParam = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return 'Google Inc. (spoofed)';  // UNMASKED_VENDOR
-        if (param === 37446) return `ANGLE (NVIDIA, Renderer-${wSeed & 0xffff})`;  // UNMASKED_RENDERER
-        return origGetParam.call(this, param);
-      };
-      const origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
-      WebGL2RenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return 'Google Inc. (spoofed)';
-        if (param === 37446) return `ANGLE (NVIDIA, Renderer-${wSeed & 0xffff})`;
-        return origGetParam2.call(this, param);
-      };
-
-      // ── Hardware concurrency (CPU cores) ───────────────────────────
-      const cores = [2, 4, 4, 8, 8, 8, 16][(cSeed % 7)];
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => cores });
-
-      // ── Device memory ───────────────────────────────────────────────
-      const mem = [2, 4, 4, 8, 8][(wSeed % 5)];
-      Object.defineProperty(navigator, 'deviceMemory', { get: () => mem });
-
-      // ── WebRTC leak protection ──────────────────────────────────────
-      if (window.RTCPeerConnection) {
-        const OrigRTC = window.RTCPeerConnection;
-        window.RTCPeerConnection = function(config, ...rest) {
-          const filteredConfig = config ? {
-            ...config,
-            iceServers: [],
-            iceTransportPolicy: 'relay',
-          } : { iceServers: [], iceTransportPolicy: 'relay' };
-          return new OrigRTC(filteredConfig, ...rest);
-        };
-        window.RTCPeerConnection.prototype = OrigRTC.prototype;
-      }
-
-    }, { cSeed, wSeed });
-
-    await page.goto('about:blank');
-
-    // Start x11vnc (raw VNC, no password)
+    // 5. Start x11vnc to capture the Xvfb display
     const vncProcess = spawn('x11vnc', [
       '-display', `:${display}`,
       '-forever', '-shared',
       '-rfbport', String(vncPort),
-      '-nopw', '-quiet', '-bg'
+      '-nopw',
+      '-noxrecord',
+      '-noxfixes',
+      '-noxdamage',
+      '-cursor', 'arrow',
     ], { detached: false, stdio: 'ignore' });
 
-    await new Promise(r => setTimeout(r, 1500));
+    await wait(2000);
 
-    // Start websockify: WebSocket on wsPort → VNC on vncPort
+    // 6. Start websockify to proxy WebSocket → VNC
     const wsProcess = spawn('websockify', [
+      '--web', noVncPath,
       String(wsPort),
       `localhost:${vncPort}`
     ], { detached: false, stdio: 'ignore' });
 
-    await new Promise(r => setTimeout(r, 500));
+    await wait(500);
 
     sessions[profileId] = {
       display, vncPort, wsPort,
-      browser, context, page,
-      xvfbProcess, vncProcess, wsProcess,
+      chromeProcess, vncProcess, wsProcess, xvfbProcess,
       startedAt: new Date().toISOString()
     };
 
@@ -269,6 +208,7 @@ app.post('/session/start', auth, async (req, res) => {
     res.json({ success: true, profileId, noVncUrl });
 
   } catch (error) {
+    console.error('Session start error:', error.message);
     try { xvfbProcess.kill(); } catch (e) {}
     res.status(500).json({ success: false, error: error.message });
   }
@@ -292,7 +232,7 @@ app.get('/session/:profileId/status', auth, (req, res) => {
 function killSession(profileId) {
   const s = sessions[profileId];
   if (!s) return;
-  try { s.browser?.close(); } catch (e) {}
+  try { s.chromeProcess?.kill('SIGKILL'); } catch (e) {}
   try { s.wsProcess?.kill('SIGKILL'); } catch (e) {}
   try { s.vncProcess?.kill('SIGKILL'); } catch (e) {}
   try { s.xvfbProcess?.kill('SIGKILL'); } catch (e) {}
@@ -305,7 +245,6 @@ app.get('/health', (req, res) => res.json({ ok: true, sessions: Object.keys(sess
 // ── HTTP server + WebSocket tunnel ──────────────────────────────────────────
 const server = http.createServer(app);
 
-// Proxy WebSocket upgrades at /ws/:profileId → local websockify port
 server.on('upgrade', (req, socket, head) => {
   const match = req.url.match(/^\/ws\/([^/?]+)/);
   if (!match) { socket.destroy(); return; }
@@ -315,7 +254,6 @@ server.on('upgrade', (req, socket, head) => {
   if (!session) { socket.destroy(); return; }
 
   const target = net.createConnection(session.wsPort, 'localhost', () => {
-    // Send HTTP upgrade response manually, then pipe raw TCP
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
       'Upgrade: websocket\r\n' +
