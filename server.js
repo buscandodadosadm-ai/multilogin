@@ -155,9 +155,11 @@ app.post('/session/start', auth, async (req, res) => {
       startedAt: new Date().toISOString()
     };
 
-    const proto = req.headers['x-forwarded-proto'] || 'http';
-    const host = req.headers.host || 'localhost';
-    const noVncUrl = `${proto}://${host}/novnc/${profileId}/vnc.html?autoconnect=true&resize=scale`;
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    const host = (req.headers.host || 'localhost').split(':')[0];
+    // Use the Railway public domain (no port) with the reverse-proxy path
+    const railwayHost = process.env.RAILWAY_PUBLIC_DOMAIN || host;
+    const noVncUrl = `https://${railwayHost}/novnc/${profileId}/vnc.html?autoconnect=true&resize=scale&reconnect=true`;
 
     res.json({ success: true, profileId, noVncUrl });
 
@@ -182,13 +184,27 @@ app.get('/session/:profileId', auth, (req, res) => {
   res.json({ active: true, profileId: req.params.profileId, startedAt: session.startedAt });
 });
 
-// noVNC reverse proxy
-app.use('/novnc/:profileId', (req, res) => {
+// noVNC static files served directly
+app.use('/novnc-static', require('express').static('/usr/share/novnc/'));
+
+// noVNC reverse proxy via http-proxy
+const { createProxyMiddleware } = require('http-proxy-middleware');
+
+app.use('/novnc/:profileId', (req, res, next) => {
   const session = sessions[req.params.profileId];
   if (!session) return res.status(404).send('Session not found');
-  const proto = req.headers['x-forwarded-proto'] || 'http';
-  const hostname = (req.headers.host || 'localhost').split(':')[0];
-  res.redirect(`${proto}://${hostname}:${session.noVncPort}/vnc.html?autoconnect=true&resize=scale`);
+
+  // Strip /novnc/:profileId prefix and proxy to local noVNC port
+  req.url = req.url.replace(`/novnc/${req.params.profileId}`, '') || '/';
+
+  const proxy = createProxyMiddleware({
+    target: `http://localhost:${session.noVncPort}`,
+    ws: true,
+    changeOrigin: true,
+    logLevel: 'silent',
+  });
+
+  proxy(req, res, next);
 });
 
 function killSession(profileId) {
@@ -205,4 +221,23 @@ function killSession(profileId) {
 app.get('/health', (req, res) => res.json({ ok: true, sessions: Object.keys(sessions).length }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ProfileVault Browser Server on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`ProfileVault Browser Server on port ${PORT}`));
+
+// Forward WebSocket upgrades to the correct noVNC session
+server.on('upgrade', (req, socket, head) => {
+  const match = req.url.match(/^\/novnc\/([^/]+)/);
+  if (!match) return socket.destroy();
+  const profileId = match[1];
+  const session = sessions[profileId];
+  if (!session) return socket.destroy();
+
+  const { createProxyMiddleware } = require('http-proxy-middleware');
+  const wsProxy = createProxyMiddleware({
+    target: `http://localhost:${session.noVncPort}`,
+    ws: true,
+    changeOrigin: true,
+    logLevel: 'silent',
+  });
+
+  wsProxy.upgrade(req, socket, head);
+});
