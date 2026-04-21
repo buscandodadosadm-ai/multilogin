@@ -41,10 +41,14 @@ app.post('/session/start', async (req, res) => {
   try {
     if (!profileId) throw new Error('profileId obrigatório');
 
+    // já existe sessão
     if (sessions[profileId]) {
+      const protocol = req.headers['x-forwarded-proto'] || 'https';
+      const host = req.headers.host;
+
       return res.json({
         success: true,
-        url: `/novnc/${profileId}`
+        url: `${protocol}://${host}/novnc/${profileId}`
       });
     }
 
@@ -63,7 +67,7 @@ app.post('/session/start', async (req, res) => {
 
     await new Promise(r => setTimeout(r, 1500));
 
-    // 2. Window manager
+    // 2. Fluxbox
     const fluxbox = spawn('fluxbox', [], {
       env: { ...process.env, DISPLAY: `:${display}` }
     });
@@ -91,7 +95,7 @@ app.post('/session/start', async (req, res) => {
 
     await new Promise(r => setTimeout(r, 1500));
 
-    // 5. WebSocket proxy interno
+    // 5. WebSocket interno
     const ws = spawn('websockify', [
       String(wsPort),
       `localhost:${vncPort}`
@@ -106,9 +110,12 @@ app.post('/session/start', async (req, res) => {
       wsPort
     };
 
-    res.json({
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers.host;
+
+    return res.json({
       success: true,
-      url: `/novnc/${profileId}`
+      url: `${protocol}://${host}/novnc/${profileId}`
     });
 
   } catch (err) {
@@ -135,7 +142,7 @@ app.post('/session/stop', async (req, res) => {
   res.json({ success: true });
 });
 
-// ================= NOVNC UI =================
+// ================= NOVNC =================
 app.get('/novnc/:profileId', (req, res) => {
   const { profileId } = req.params;
   const session = sessions[profileId];
@@ -176,11 +183,9 @@ app.get('/novnc/:profileId', (req, res) => {
 app.use('/novnc', express.static('/usr/share/novnc'));
 
 // ================= HEALTH =================
-app.get('/health', (req, res) => {
-  res.send('OK');
-});
+app.get('/health', (req, res) => res.send('OK'));
 
-// ================= WS TUNNEL (CRÍTICO) =================
+// ================= WS TUNNEL =================
 const server = http.createServer(app);
 
 server.on('upgrade', (req, socket, head) => {
