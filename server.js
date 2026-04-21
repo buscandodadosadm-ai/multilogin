@@ -64,6 +64,10 @@ app.post('/session/start', async (req, res) => {
       '--disable-dev-shm-usage',
       '--window-size=1920,1080',
       '--disable-blink-features=AutomationControlled',
+      '--disable-extensions',
+      '--disable-plugins',
+      '--no-first-run',
+      '--no-default-browser-check',
       'about:blank'
     ];
 
@@ -87,7 +91,7 @@ app.post('/session/start', async (req, res) => {
     chrome.stdout?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
     chrome.stderr?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
 
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 5000));
 
     // 4. x11vnc
     console.log(`[4] Iniciando x11vnc na porta ${vncPort}...`);
@@ -198,6 +202,61 @@ app.get('/session/:profileId/status', (req, res) => {
     uptime: Math.floor(uptime / 1000),
     ports: { vnc: s.vncPort, ws: s.wsPort }
   });
+});
+
+// ================= WEBSOCKET PROXY (para noVNC via JS) =================
+const WebSocket = require('ws');
+const wsServer = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url.startsWith('/ws/')) {
+    wsServer.handleUpgrade(req, socket, head, (ws) => {
+      const profileId = req.url.split('/').pop();
+      const s = sessions[profileId];
+
+      if (!s) {
+        ws.close(1008, 'Session not found');
+        return;
+      }
+
+      console.log(`[WebSocket] Client conectado a ${profileId}`);
+
+      // Conectar ao x11vnc
+      const vncSocket = require('net').createConnection({
+        host: 'localhost',
+        port: s.vncPort
+      });
+
+      vncSocket.on('data', (data) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data);
+        }
+      });
+
+      vncSocket.on('error', (err) => {
+        console.error(`[VNC Socket] erro:`, err.message);
+        ws.close(1011, 'VNC connection error');
+      });
+
+      vncSocket.on('close', () => {
+        ws.close(1000);
+      });
+
+      ws.on('message', (data) => {
+        vncSocket.write(data);
+      });
+
+      ws.on('close', () => {
+        vncSocket.destroy();
+        console.log(`[WebSocket] Client desconectado de ${profileId}`);
+      });
+
+      ws.on('error', (err) => {
+        console.error(`[WebSocket] erro:`, err.message);
+        vncSocket.destroy();
+      });
+    });
+  }
 });
 
 // ================= NOVNC HTML PAGE =================
