@@ -2,114 +2,143 @@
 // @ts-nocheck
 
 const express = require('express');
+const { spawn } = require('child_process');
 const cors = require('cors');
-const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
-const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const PORT = process.env.PORT || 3000;
-const SECRET = process.env.SERVICE_SECRET || "123";
-
 const sessions = {};
-const PROFILES_DIR = path.join(__dirname, 'profiles');
 
-if (!fs.existsSync(PROFILES_DIR)) {
-  fs.mkdirSync(PROFILES_DIR);
-}
+const BASE_DISPLAY = 99;
+const BASE_VNC = 5900;
+const BASE_WS = 6080;
 
-// ================= HEALTH (NUNCA FALHA) =================
-app.get('/health', (req, res) => {
-  return res.status(200).send('OK');
-});
+// ================= PORTAS POR PERFIL =================
+function getPorts(profileId) {
+  const hash = parseInt(
+    crypto.createHash('md5').update(profileId).digest('hex').slice(0, 4),
+    16
+  );
 
-// ================= AUTH =================
-function auth(req, res, next) {
-  const key = req.headers['x-service-secret'];
-  if (key !== SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
+  const slot = hash % 50;
+
+  return {
+    display: BASE_DISPLAY + slot,
+    vncPort: BASE_VNC + slot,
+    wsPort: BASE_WS + slot
+  };
 }
 
 // ================= START SESSION =================
-app.post('/session/start', auth, async (req, res) => {
+app.post('/session/start', async (req, res) => {
   const { profileId } = req.body;
-
-  console.log('🚀 START SESSION:', profileId);
 
   try {
     if (!profileId) throw new Error('profileId obrigatório');
 
-    const profilePath = path.join(PROFILES_DIR, profileId);
-
-    if (!fs.existsSync(profilePath)) {
-      fs.mkdirSync(profilePath, { recursive: true });
-    }
-
-    // fecha sessão anterior
     if (sessions[profileId]) {
-      try { await sessions[profileId].close(); } catch {}
-      delete sessions[profileId];
+      return res.json({ success: true });
     }
 
-    console.log('🌐 Abrindo browser...');
+    const { display, vncPort, wsPort } = getPorts(profileId);
 
-    const context = await chromium.launchPersistentContext(profilePath, {
-      headless: true, // 🔥 IMPORTANTE: estabilidade no Railway
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+    console.log('🚀 START', profileId);
+
+    // 1. Xvfb (display virtual)
+    const xvfb = spawn('Xvfb', [
+      `:${display}`,
+      '-screen',
+      '0',
+      '1280x720x24',
+      '-ac'
+    ]);
+
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 2. Fluxbox (window manager)
+    const fluxbox = spawn('fluxbox', [], {
+      env: { ...process.env, DISPLAY: `:${display}` }
     });
 
-    console.log('✅ Browser OK');
-
-    const page = await context.newPage();
-
-    await page.goto('https://example.com', {
-      timeout: 60000,
-      waitUntil: 'domcontentloaded'
+    // 3. Chromium
+    const chrome = spawn('chromium', [
+      '--no-sandbox',
+      '--disable-gpu',
+      '--window-size=1280,720',
+      'https://www.google.com'
+    ], {
+      env: { ...process.env, DISPLAY: `:${display}` }
     });
 
-    console.log('✅ Navegação OK');
+    await new Promise(r => setTimeout(r, 2000));
 
-    sessions[profileId] = context;
+    // 4. VNC
+    const vnc = spawn('x11vnc', [
+      '-display', `:${display}`,
+      '-forever',
+      '-nopw',
+      '-rfbport', String(vncPort)
+    ]);
 
-    return res.json({
-      status: "ok",
+    await new Promise(r => setTimeout(r, 2000));
+
+    // 5. noVNC (web)
+    const ws = spawn('websockify', [
+      '--web', '/usr/share/novnc',
+      String(wsPort),
+      `localhost:${vncPort}`
+    ]);
+
+    sessions[profileId] = { xvfb, fluxbox, chrome, vnc, ws };
+
+    const host = req.headers.host;
+    const url = `https://${host}/novnc/${profileId}`;
+
+    res.json({
       success: true,
-      data: { profileId }
+      url
     });
 
-  } catch (error) {
-    console.error('❌ ERRO:', error);
-
-    return res.status(500).json({
-      status: "error",
-      message: error.message
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ================= STOP =================
-app.post('/session/stop', auth, async (req, res) => {
-  const { profileId } = req.body;
+// ================= NOVNC PAGE =================
+app.get('/novnc/:profileId', (req, res) => {
+  const { profileId } = req.params;
+  const { wsPort } = getPorts(profileId);
 
-  if (sessions[profileId]) {
-    try { await sessions[profileId].close(); } catch {}
-    delete sessions[profileId];
-  }
+  const host = req.headers.host;
 
-  return res.json({ status: "ok" });
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Browser ${profileId}</title>
+  <script src="/novnc/vnc.html"></script>
+</head>
+<body style="margin:0">
+  <iframe src="/vnc.html?host=${host}&port=${wsPort}" width="100%" height="100%"></iframe>
+</body>
+</html>
+  `);
 });
 
-// ================= START SERVER =================
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('🔥 SERVER INICIADO NA PORTA', PORT);
+// ================= STATIC NOVNC =================
+app.use('/novnc', express.static('/usr/share/novnc'));
+
+// ================= HEALTH =================
+app.get('/health', (req, res) => res.send('OK'));
+
+// ================= START =================
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log('🚀 Server rodando', PORT);
 });
