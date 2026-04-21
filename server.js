@@ -5,7 +5,6 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -16,10 +15,10 @@ const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
 const PROFILES_DIR = path.join(__dirname, 'profiles');
+const EXTENSIONS_DIR = path.join(__dirname, 'extensions');
 
-if (!fs.existsSync(PROFILES_DIR)) {
-  fs.mkdirSync(PROFILES_DIR);
-}
+if (!fs.existsSync(PROFILES_DIR)) fs.mkdirSync(PROFILES_DIR);
+if (!fs.existsSync(EXTENSIONS_DIR)) fs.mkdirSync(EXTENSIONS_DIR);
 
 // ================= AUTH =================
 function auth(req, res, next) {
@@ -30,20 +29,20 @@ function auth(req, res, next) {
   next();
 }
 
-// ================= PROXY =================
-function parseProxy(proxyRaw, proxyType) {
+// ================= PARSE PROXY =================
+function parseProxy(proxyRaw) {
   if (!proxyRaw) return null;
 
   const parts = proxyRaw.split(':');
-  const scheme = proxyType === 'socks5' ? 'socks5' : 'http';
 
   if (parts.length === 2) {
-    return { server: `${scheme}://${parts[0]}:${parts[1]}` };
+    return { host: parts[0], port: parts[1] };
   }
 
   if (parts.length === 4) {
     return {
-      server: `${scheme}://${parts[0]}:${parts[1]}`,
+      host: parts[0],
+      port: parts[1],
       username: parts[2],
       password: parts[3]
     };
@@ -52,37 +51,77 @@ function parseProxy(proxyRaw, proxyType) {
   return null;
 }
 
-// ================= TESTE REDE =================
-function testNetwork() {
-  return new Promise((resolve) => {
-    https.get('https://example.com', (res) => {
-      console.log('🌐 STATUS REDE:', res.statusCode);
-      resolve(true);
-    }).on('error', (e) => {
-      console.log('❌ ERRO REDE:', e.message);
-      resolve(false);
-    });
-  });
+// ================= CRIAR EXTENSÃO =================
+function createProxyExtension(profileId, proxy) {
+  const extPath = path.join(EXTENSIONS_DIR, profileId);
+
+  if (!fs.existsSync(extPath)) {
+    fs.mkdirSync(extPath, { recursive: true });
+  }
+
+  const manifest = `
+{
+  "manifest_version": 2,
+  "name": "ProxyAuth",
+  "version": "1.0",
+  "permissions": [
+    "proxy",
+    "tabs",
+    "storage",
+    "<all_urls>",
+    "webRequest",
+    "webRequestBlocking"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  }
+}
+`;
+
+  const background = `
+var config = {
+  mode: "fixed_servers",
+  rules: {
+    singleProxy: {
+      scheme: "http",
+      host: "${proxy.host}",
+      port: parseInt(${proxy.port})
+    },
+    bypassList: ["localhost"]
+  }
+};
+
+chrome.proxy.settings.set({ value: config, scope: "regular" });
+
+chrome.webRequest.onAuthRequired.addListener(
+  function(details) {
+    return {
+      authCredentials: {
+        username: "${proxy.username || ''}",
+        password: "${proxy.password || ''}"
+      }
+    };
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking"]
+);
+`;
+
+  fs.writeFileSync(path.join(extPath, 'manifest.json'), manifest);
+  fs.writeFileSync(path.join(extPath, 'background.js'), background);
+
+  return extPath;
 }
 
 // ================= START =================
 app.post('/session/start', auth, async (req, res) => {
-  const { profileId, proxyRaw, proxyType, userAgent, timezone, language } = req.body;
+  const { profileId, proxyRaw, userAgent, timezone, language } = req.body;
 
-  console.log('\n==============================');
-  console.log('🚀 START SESSION');
+  console.log('\n🚀 START SESSION');
   console.log(req.body);
-  console.log('==============================\n');
 
   try {
     if (!profileId) throw new Error('profileId obrigatório');
-
-    // 🔥 TESTE DE REDE
-    const netOk = await testNetwork();
-
-    if (!netOk) {
-      throw new Error('Sem acesso à internet no container');
-    }
 
     const profilePath = path.join(PROFILES_DIR, profileId);
 
@@ -90,58 +129,54 @@ app.post('/session/start', auth, async (req, res) => {
       fs.mkdirSync(profilePath, { recursive: true });
     }
 
-    const proxy = parseProxy(proxyRaw, proxyType);
+    const proxy = parseProxy(proxyRaw);
     console.log('Proxy:', proxy);
 
     // encerra sessão antiga
     if (sessions[profileId]) {
-      console.log('Encerrando sessão antiga...');
       try { await sessions[profileId].context.close(); } catch {}
       delete sessions[profileId];
     }
 
-    console.log('1️⃣ Abrindo browser...');
+    let extensionPath = null;
+
+    if (proxy && proxy.username) {
+      console.log('🔌 Criando extensão de proxy...');
+      extensionPath = createProxyExtension(profileId, proxy);
+    }
+
+    console.log('🌐 Abrindo browser...');
 
     const context = await chromium.launchPersistentContext(profilePath, {
-      headless: true,
-      proxy: proxy || undefined,
+      headless: false, // obrigatório para extensão
       viewport: { width: 1280, height: 720 },
       userAgent: userAgent || undefined,
       locale: language || 'pt-BR',
       timezoneId: timezone || 'America/Sao_Paulo',
-      ignoreHTTPSErrors: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
-        '--ignore-certificate-errors'
+        ...(extensionPath
+          ? [
+              `--disable-extensions-except=${extensionPath}`,
+              `--load-extension=${extensionPath}`
+            ]
+          : [])
       ]
     });
 
-    console.log('2️⃣ Browser OK');
+    console.log('✅ Browser OK');
 
     const page = context.pages()[0] || await context.newPage();
-
-    console.log('3️⃣ Teste interno (sem internet)...');
-
-    // 🔥 TESTE INTERNO
-    await page.setContent('<h1>TESTE OK</h1>');
-
-    console.log('4️⃣ Teste interno OK');
-
-    console.log('5️⃣ Teste navegação externa...');
 
     await page.goto('http://example.com', {
       timeout: 60000,
       waitUntil: 'commit'
     });
 
-    console.log('6️⃣ Navegação OK');
+    console.log('✅ Navegação OK');
 
-    // teste IP
     try {
       const resp = await page.goto('http://api.ipify.org?format=json');
       const body = await resp.text();
@@ -153,18 +188,18 @@ app.post('/session/start', auth, async (req, res) => {
     sessions[profileId] = { context };
 
     res.json({
+      status: "ok",
       success: true,
-      profileId,
-      message: 'Sessão iniciada com sucesso'
+      data: { profileId }
     });
 
   } catch (error) {
-    console.error('\n❌ ERRO COMPLETO:\n', error);
+    console.error('❌ ERRO COMPLETO:', error);
 
     res.status(500).json({
+      status: "error",
       success: false,
-      error: error.message,
-      stack: error.stack
+      message: error.message
     });
   }
 });
@@ -178,7 +213,7 @@ app.post('/session/stop', auth, async (req, res) => {
     delete sessions[profileId];
   }
 
-  res.json({ success: true });
+  res.json({ status: "ok" });
 });
 
 // ================= HEALTH =================
