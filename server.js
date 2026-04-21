@@ -12,6 +12,15 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
+// ================= ESTABILIDADE GLOBAL =================
+process.on('uncaughtException', (err) => {
+  console.error('ERRO GLOBAL:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('PROMISE NÃO TRATADA:', err);
+});
+
 // ================= AUTH =================
 function auth(req, res, next) {
   const key = req.headers['x-service-secret'];
@@ -21,7 +30,7 @@ function auth(req, res, next) {
   next();
 }
 
-// ================= PROXY =================
+// ================= PROXY (HTTP + SOCKS5) =================
 function parseProxy(proxyRaw, proxyType) {
   if (!proxyRaw) return null;
 
@@ -47,43 +56,67 @@ function parseProxy(proxyRaw, proxyType) {
   return null;
 }
 
-// ================= START =================
+// ================= START SESSION =================
 app.post('/session/start', auth, async (req, res) => {
-  const { profileId, proxyRaw, proxyType } = req.body;
-
-  console.log('==== INICIO DE SESSÃO ====');
-  console.log(req.body);
+  const {
+    profileId,
+    proxyRaw,
+    proxyType,
+    userAgent,
+    cookies,
+    timezone,
+    language
+  } = req.body;
 
   if (!profileId) {
     return res.status(400).json({ error: 'profileId required' });
   }
 
-  if (sessions[profileId]) {
-    return res.status(400).json({ error: 'Perfil já em uso' });
-  }
-
   try {
-    const proxy = parseProxy(proxyRaw, proxyType);
-    console.log('Proxy processado:', proxy);
+    // 🔥 AUTO-KILL sessão existente
+    if (sessions[profileId]) {
+      console.log('Sessão já existe, encerrando automaticamente...');
 
-    // ================= TESTE: LAUNCH =================
+      try {
+        await sessions[profileId].page.close();
+        await sessions[profileId].context.close();
+        await sessions[profileId].browser.close();
+      } catch (e) {}
+
+      delete sessions[profileId];
+    }
+
+    const proxy = parseProxy(proxyRaw, proxyType);
+
+    console.log('==== NOVA SESSÃO ====');
+    console.log('Perfil:', profileId);
+    console.log('Proxy:', proxy);
+
     const browser = await chromium.launch({
       headless: true,
       timeout: 60000
     });
 
-    console.log('Browser iniciado');
-
     const context = await browser.newContext({
+      userAgent: userAgent || undefined,
+      locale: language || 'pt-BR',
+      timezoneId: timezone || 'America/Sao_Paulo',
       proxy: proxy || undefined,
+      viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true
     });
 
-    console.log('Context criado');
+    // ================= COOKIES =================
+    if (cookies && Array.isArray(cookies)) {
+      try {
+        await context.addCookies(cookies);
+        console.log('Cookies aplicados');
+      } catch (e) {
+        console.log('Erro ao aplicar cookies:', e.message);
+      }
+    }
 
     const page = await context.newPage();
-
-    console.log('Página criada');
 
     // ================= TESTE DE CONEXÃO =================
     await page.goto('http://example.com', {
@@ -91,7 +124,18 @@ app.post('/session/start', auth, async (req, res) => {
       waitUntil: 'commit'
     });
 
-    console.log('Navegação OK');
+    console.log('Navegação inicial OK');
+
+    // ================= TESTE DE IP =================
+    try {
+      const ipCheck = await page.goto('http://api.ipify.org?format=json', {
+        timeout: 30000
+      });
+      const body = await ipCheck.text();
+      console.log('IP do proxy:', body);
+    } catch (e) {
+      console.log('Falha ao validar proxy:', e.message);
+    }
 
     sessions[profileId] = {
       browser,
@@ -102,25 +146,28 @@ app.post('/session/start', auth, async (req, res) => {
 
     res.json({
       success: true,
-      profileId
+      profileId,
+      status: 'running'
     });
 
   } catch (error) {
-    console.error('ERRO COMPLETO:', error);
+    console.error('ERRO AO INICIAR SESSÃO:', error);
 
     res.status(500).json({
-      error: error.message,
-      stack: error.stack
+      success: false,
+      error: error.message
     });
   }
 });
 
-// ================= STOP =================
+// ================= STOP SESSION =================
 app.post('/session/stop', auth, async (req, res) => {
   const { profileId } = req.body;
 
   const session = sessions[profileId];
-  if (!session) return res.json({ success: false });
+  if (!session) {
+    return res.json({ success: false });
+  }
 
   try {
     await session.page.close();
@@ -133,11 +180,37 @@ app.post('/session/stop', auth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ================= HEALTH =================
-app.get('/health', (req, res) => {
-  res.json({ ok: true });
+// ================= STATUS =================
+app.get('/session/:profileId/status', auth, (req, res) => {
+  const s = sessions[req.params.profileId];
+
+  res.json({
+    active: !!s,
+    startedAt: s?.startedAt || null
+  });
 });
 
+// ================= LIST =================
+app.get('/sessions', auth, (req, res) => {
+  res.json({
+    total: Object.keys(sessions).length,
+    sessions: Object.keys(sessions)
+  });
+});
+
+// ================= HEALTH =================
+app.get('/health', (req, res) => {
+  try {
+    res.status(200).json({
+      ok: true,
+      sessions: Object.keys(sessions).length
+    });
+  } catch (e) {
+    res.status(200).json({ ok: false });
+  }
+});
+
+// ================= START SERVER =================
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Servidor rodando...');
+  console.log('Multilogin Worker rodando...');
 });
