@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -51,15 +52,37 @@ function parseProxy(proxyRaw, proxyType) {
   return null;
 }
 
+// ================= TESTE REDE =================
+function testNetwork() {
+  return new Promise((resolve) => {
+    https.get('https://example.com', (res) => {
+      console.log('🌐 STATUS REDE:', res.statusCode);
+      resolve(true);
+    }).on('error', (e) => {
+      console.log('❌ ERRO REDE:', e.message);
+      resolve(false);
+    });
+  });
+}
+
 // ================= START =================
 app.post('/session/start', auth, async (req, res) => {
   const { profileId, proxyRaw, proxyType, userAgent, timezone, language } = req.body;
 
-  console.log('\n===== START SESSION =====');
+  console.log('\n==============================');
+  console.log('🚀 START SESSION');
   console.log(req.body);
+  console.log('==============================\n');
 
   try {
     if (!profileId) throw new Error('profileId obrigatório');
+
+    // 🔥 TESTE DE REDE
+    const netOk = await testNetwork();
+
+    if (!netOk) {
+      throw new Error('Sem acesso à internet no container');
+    }
 
     const profilePath = path.join(PROFILES_DIR, profileId);
 
@@ -72,9 +95,12 @@ app.post('/session/start', auth, async (req, res) => {
 
     // encerra sessão antiga
     if (sessions[profileId]) {
+      console.log('Encerrando sessão antiga...');
       try { await sessions[profileId].context.close(); } catch {}
       delete sessions[profileId];
     }
+
+    console.log('1️⃣ Abrindo browser...');
 
     const context = await chromium.launchPersistentContext(profilePath, {
       headless: true,
@@ -88,41 +114,57 @@ app.post('/session/start', auth, async (req, res) => {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--no-zygote',
         '--ignore-certificate-errors'
       ]
     });
 
+    console.log('2️⃣ Browser OK');
+
     const page = context.pages()[0] || await context.newPage();
 
-    // 🔥 TESTE MAIS ESTÁVEL (não usar Google)
+    console.log('3️⃣ Teste interno (sem internet)...');
+
+    // 🔥 TESTE INTERNO
+    await page.setContent('<h1>TESTE OK</h1>');
+
+    console.log('4️⃣ Teste interno OK');
+
+    console.log('5️⃣ Teste navegação externa...');
+
     await page.goto('http://example.com', {
       timeout: 60000,
       waitUntil: 'commit'
     });
 
-    console.log('✅ Navegação OK');
+    console.log('6️⃣ Navegação OK');
 
-    // teste IP (se proxy estiver ativo)
+    // teste IP
     try {
       const resp = await page.goto('http://api.ipify.org?format=json');
       const body = await resp.text();
       console.log('🌍 IP:', body);
     } catch (e) {
-      console.log('⚠️ Falha ao obter IP:', e.message);
+      console.log('⚠️ Falha IP:', e.message);
     }
 
     sessions[profileId] = { context };
 
     res.json({
       success: true,
-      profileId
+      profileId,
+      message: 'Sessão iniciada com sucesso'
     });
 
   } catch (error) {
-    console.error('❌ ERRO REAL:', error);
+    console.error('\n❌ ERRO COMPLETO:\n', error);
 
     res.status(500).json({
-      error: error.message
+      success: false,
+      error: error.message,
+      stack: error.stack
     });
   }
 });
