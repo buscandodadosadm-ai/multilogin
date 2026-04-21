@@ -21,7 +21,7 @@ function auth(req, res, next) {
   next();
 }
 
-// ================= PROXY (HTTP + SOCKS5) =================
+// ================= PROXY =================
 function parseProxy(proxyRaw, proxyType) {
   if (!proxyRaw) return null;
 
@@ -49,15 +49,10 @@ function parseProxy(proxyRaw, proxyType) {
 
 // ================= START =================
 app.post('/session/start', auth, async (req, res) => {
-  const {
-    profileId,
-    proxyRaw,
-    proxyType,
-    userAgent,
-    cookies,
-    timezone,
-    language
-  } = req.body;
+  const { profileId, proxyRaw, proxyType } = req.body;
+
+  console.log('==== INICIO DE SESSÃO ====');
+  console.log(req.body);
 
   if (!profileId) {
     return res.status(400).json({ error: 'profileId required' });
@@ -69,34 +64,26 @@ app.post('/session/start', auth, async (req, res) => {
 
   try {
     const proxy = parseProxy(proxyRaw, proxyType);
+    console.log('Proxy processado:', proxy);
 
-    console.log('==== NOVA SESSÃO ====');
-    console.log('Perfil:', profileId);
-    console.log('Proxy:', proxy);
-
+    // ================= TESTE: LAUNCH =================
     const browser = await chromium.launch({
-      headless: true
+      headless: true,
+      timeout: 60000
     });
+
+    console.log('Browser iniciado');
 
     const context = await browser.newContext({
-      userAgent: userAgent || undefined,
-      locale: language || 'pt-BR',
-      timezoneId: timezone || 'America/Sao_Paulo',
       proxy: proxy || undefined,
-      viewport: { width: 1280, height: 720 }
+      ignoreHTTPSErrors: true
     });
 
-    // ================= COOKIES =================
-    if (cookies && Array.isArray(cookies)) {
-      try {
-        await context.addCookies(cookies);
-        console.log('Cookies aplicados');
-      } catch (e) {
-        console.log('Erro ao aplicar cookies:', e.message);
-      }
-    }
+    console.log('Context criado');
 
     const page = await context.newPage();
+
+    console.log('Página criada');
 
     // ================= TESTE DE CONEXÃO =================
     await page.goto('http://example.com', {
@@ -104,16 +91,7 @@ app.post('/session/start', auth, async (req, res) => {
       waitUntil: 'commit'
     });
 
-    // ================= TESTE DE IP =================
-    try {
-      const ipCheck = await page.goto('http://api.ipify.org?format=json', {
-        timeout: 30000
-      });
-      const body = await ipCheck.text();
-      console.log('IP do proxy:', body);
-    } catch (e) {
-      console.log('Falha ao validar proxy:', e.message);
-    }
+    console.log('Navegação OK');
 
     sessions[profileId] = {
       browser,
@@ -124,13 +102,16 @@ app.post('/session/start', auth, async (req, res) => {
 
     res.json({
       success: true,
-      profileId,
-      status: 'running'
+      profileId
     });
 
   } catch (error) {
-    console.error('Erro ao iniciar sessão:', error.message);
-    res.status(500).json({ error: error.message });
+    console.error('ERRO COMPLETO:', error);
+
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack
+    });
   }
 });
 
@@ -152,28 +133,11 @@ app.post('/session/stop', auth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ================= STATUS =================
-app.get('/session/:profileId/status', auth, (req, res) => {
-  const s = sessions[req.params.profileId];
-  res.json({
-    active: !!s,
-    startedAt: s?.startedAt || null
-  });
-});
-
-// ================= LIST =================
-app.get('/sessions', auth, (req, res) => {
-  res.json({
-    total: Object.keys(sessions).length,
-    sessions: Object.keys(sessions)
-  });
-});
-
 // ================= HEALTH =================
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Multilogin Worker rodando...');
+  console.log('Servidor rodando...');
 });
