@@ -3,6 +3,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -12,14 +14,12 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
-// ================= DEBUG GLOBAL =================
-process.on('uncaughtException', (err) => {
-  console.error('🔥 ERRO GLOBAL:', err);
-});
+const PROFILES_DIR = path.join(__dirname, 'profiles');
 
-process.on('unhandledRejection', (err) => {
-  console.error('🔥 PROMISE NÃO TRATADA:', err);
-});
+// garante pasta base
+if (!fs.existsSync(PROFILES_DIR)) {
+  fs.mkdirSync(PROFILES_DIR);
+}
 
 // ================= AUTH =================
 function auth(req, res, next) {
@@ -54,34 +54,34 @@ function parseProxy(proxyRaw, proxyType) {
 
 // ================= START =================
 app.post('/session/start', auth, async (req, res) => {
-  const { profileId, proxyRaw, proxyType } = req.body;
+  const { profileId, proxyRaw, proxyType, userAgent, timezone, language } = req.body;
 
-  console.log('\n==============================');
-  console.log('🚀 NOVA SESSÃO');
-  console.log(req.body);
-  console.log('==============================\n');
+  console.log('START:', profileId);
 
   try {
-    if (!profileId) {
-      throw new Error('profileId não enviado');
+    if (!profileId) throw new Error('profileId obrigatório');
+
+    const profilePath = path.join(PROFILES_DIR, profileId);
+
+    if (!fs.existsSync(profilePath)) {
+      fs.mkdirSync(profilePath, { recursive: true });
     }
 
     const proxy = parseProxy(proxyRaw, proxyType);
-    console.log('Proxy:', proxy);
 
-    // matar sessão antiga
+    // mata sessão antiga
     if (sessions[profileId]) {
-      console.log('Encerrando sessão anterior...');
-      try { await sessions[profileId].browser.close(); } catch {}
+      try { await sessions[profileId].context.close(); } catch {}
       delete sessions[profileId];
     }
 
-    console.log('1️⃣ Launch browser...');
-
-    const browser = await chromium.launch({
+    const context = await chromium.launchPersistentContext(profilePath, {
       headless: true,
-      timeout: 60000,
       proxy: proxy || undefined,
+      viewport: { width: 1280, height: 720 },
+      userAgent: userAgent || undefined,
+      locale: language || 'pt-BR',
+      timezoneId: timezone || 'America/Sao_Paulo',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -90,50 +90,40 @@ app.post('/session/start', auth, async (req, res) => {
       ]
     });
 
-    console.log('2️⃣ Browser OK');
+    const page = context.pages()[0] || await context.newPage();
 
-    const context = await browser.newContext({
-      ignoreHTTPSErrors: true
-    });
-
-    console.log('3️⃣ Context OK');
-
-    const page = await context.newPage();
-
-    console.log('4️⃣ Page OK');
-
-    await page.goto('http://example.com', {
+    await page.goto('https://www.google.com', {
       timeout: 60000,
-      waitUntil: 'commit'
+      waitUntil: 'domcontentloaded'
     });
 
-    console.log('5️⃣ Navegação OK');
-
-    // teste IP
-    try {
-      const resp = await page.goto('http://api.ipify.org?format=json');
-      const body = await resp.text();
-      console.log('🌍 IP:', body);
-    } catch (e) {
-      console.log('⚠️ Erro ao pegar IP:', e.message);
-    }
-
-    sessions[profileId] = { browser };
+    sessions[profileId] = { context };
 
     res.json({
       success: true,
-      message: 'Sessão iniciada com sucesso'
+      message: 'Sessão iniciada com persistência',
+      profileId
     });
 
   } catch (error) {
-    console.error('❌ ERRO REAL DETALHADO:\n', error);
+    console.error('ERRO:', error);
 
     res.status(500).json({
-      success: false,
-      error: error.message,
-      stack: error.stack
+      error: error.message
     });
   }
+});
+
+// ================= STOP =================
+app.post('/session/stop', auth, async (req, res) => {
+  const { profileId } = req.body;
+
+  if (sessions[profileId]) {
+    try { await sessions[profileId].context.close(); } catch {}
+    delete sessions[profileId];
+  }
+
+  res.json({ success: true });
 });
 
 // ================= HEALTH =================
@@ -141,9 +131,9 @@ app.get('/health', (req, res) => {
   res.send('OK');
 });
 
-// ================= START SERVER =================
+// ================= START =================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor rodando na porta', PORT);
+  console.log('Servidor rodando');
 });
