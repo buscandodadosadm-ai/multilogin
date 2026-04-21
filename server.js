@@ -1,3 +1,4 @@
+/* global require, process */
 const express = require('express');
 const { spawn } = require('child_process');
 const http = require('http');
