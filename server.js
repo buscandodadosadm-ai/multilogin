@@ -1,178 +1,262 @@
-/* eslint-disable */
-// @ts-nocheck
-
 const express = require('express');
 const { spawn } = require('child_process');
-const cors = require('cors');
-const crypto = require('crypto');
 const http = require('http');
-const net = require('net');
+const cors = require('cors');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const sessions = {};
-
-const BASE_DISPLAY = 99;
-const BASE_VNC = 5900;
-const BASE_WS = 6080;
-
-// ================= PORTAS POR PERFIL =================
-function getPorts(profileId) {
-  const hash = parseInt(
-    crypto.createHash('md5').update(profileId).digest('hex').slice(0, 4),
-    16
-  );
-
-  const slot = hash % 50;
-
-  return {
-    display: BASE_DISPLAY + slot,
-    vncPort: BASE_VNC + slot,
-    wsPort: BASE_WS + slot
-  };
-}
+const sessions = {}; // profileId → { xvfb, chrome, vnc, ws, ports }
 
 // ================= START SESSION =================
 app.post('/session/start', async (req, res) => {
-  const { profileId } = req.body;
+  const {
+    profileId,
+    userId,
+    proxyRaw,
+    proxyType = 'http',
+    userAgent,
+    timezone,
+    language,
+    canvasSeed,
+    webglSeed,
+    cookies
+  } = req.body;
+
+  if (!profileId) {
+    return res.status(400).json({ error: 'profileId required' });
+  }
 
   try {
-    if (!profileId) throw new Error('profileId obrigatório');
+    const displayNum = Math.floor(Math.random() * 1000) + 100;
+    const display = `:${displayNum}`;
+    const vncPort = 5900 + displayNum;
+    const wsPort = 6900 + displayNum;
 
-    // já existe sessão
-    if (sessions[profileId]) {
-      const protocol = req.headers['x-forwarded-proto'] || 'https';
-      const host = req.headers.host;
+    console.log(`\n========== START ${profileId} ==========`);
+    console.log(`Display: ${display}, VNC: ${vncPort}, WS: ${wsPort}`);
 
-      return res.json({
-        success: true,
-        url: `${protocol}://${host}/novnc/${profileId}`
-      });
-    }
-
-    const { display, vncPort, wsPort } = getPorts(profileId);
-
-    console.log(`🚀 START SESSION: ${profileId} (display :${display}, VNC ${vncPort}, WS ${wsPort})`);
-
-    // 1. Xvfb
+    // 1. Xvfb (virtual display)
+    console.log(`[1] Iniciando Xvfb no ${display}...`);
     const xvfb = spawn('Xvfb', [
-      `:${display}`,
-      '-screen',
-      '0',
-      '1280x720x24',
-      '-ac'
+      display,
+      '-screen', '0', '1920x1080x24',
+      '-listen', 'tcp'
     ]);
     xvfb.on('error', err => console.error(`[Xvfb] erro:`, err));
-    xvfb.stderr?.on('data', d => console.log(`[Xvfb stderr]`, d.toString()));
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1000));
 
-    // 2. Fluxbox
+    // 2. Fluxbox (window manager)
+    console.log(`[2] Iniciando Fluxbox...`);
     const fluxbox = spawn('fluxbox', [], {
-      env: { ...process.env, DISPLAY: `:${display}` }
+      env: { ...process.env, DISPLAY: display }
     });
     fluxbox.on('error', err => console.error(`[Fluxbox] erro:`, err));
 
     // 3. Chromium
-    const chrome = spawn('chromium', [
+    console.log(`[3] Iniciando Chromium...`);
+    const chromeArgs = [
+      '--headless=new',
       '--no-sandbox',
       '--disable-gpu',
-      '--window-size=1280,720',
-      'https://www.google.com'
-    ], {
-      env: { ...process.env, DISPLAY: `:${display}` }
+      '--disable-dev-shm-usage',
+      '--single-process',
+      `--display=${display}`,
+      '--window-size=1920,1080',
+      '--disable-blink-features=AutomationControlled',
+      'about:blank'
+    ];
+
+    // Proxy
+    if (proxyRaw) {
+      const proxyUrl = proxyType === 'socks5'
+        ? `socks5://${proxyRaw}`
+        : `http://${proxyRaw}`;
+      chromeArgs.push(`--proxy-server=${proxyUrl}`);
+    }
+
+    // User-Agent
+    if (userAgent) {
+      chromeArgs.push(`--user-agent=${userAgent}`);
+    }
+
+    const chrome = spawn('chromium', chromeArgs, {
+      env: { ...process.env, DISPLAY: display }
     });
-    chrome.on('error', err => console.error(`[Chrome] erro:`, err));
+    chrome.on('error', err => console.error(`[Chromium] erro:`, err));
+    chrome.stdout?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
+    chrome.stderr?.on('data', d => console.log(`[Chromium]`, d.toString().slice(0, 80)));
 
     await new Promise(r => setTimeout(r, 3000));
 
-    // 4. VNC
+    // 4. x11vnc
+    console.log(`[4] Iniciando x11vnc na porta ${vncPort}...`);
     const vnc = spawn('x11vnc', [
-      '-display', `:${display}`,
+      '-display', display,
       '-forever',
       '-shared',
       '-rfbport', String(vncPort),
       '-nopw',
-      '-norc'
+      '-norc',
+      '-xkb'
     ]);
     vnc.on('error', err => console.error(`[x11vnc] erro:`, err));
-    vnc.stdout?.on('data', d => console.log(`[x11vnc stdout]`, d.toString().slice(0, 100)));
-    vnc.stderr?.on('data', d => console.log(`[x11vnc stderr]`, d.toString().slice(0, 100)));
+    vnc.stdout?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
+    vnc.stderr?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
 
+    await new Promise(r => setTimeout(r, 2000));
+
+    // 5. websockify (WebSocket → RFB proxy)
+    console.log(`[5] Iniciando websockify na porta ${wsPort}...`);
+    const ws = spawn('websockify', [
+      '--web', '/usr/share/novnc',
+      String(wsPort),
+      `localhost:${vncPort}`
+    ]);
+    ws.on('error', err => console.error(`[websockify] erro:`, err));
+    ws.stdout?.on('data', d => console.log(`[websockify]`, d.toString().trim()));
+    ws.stderr?.on('data', d => console.log(`[websockify]`, d.toString().trim()));
+
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Salva sessão
     sessions[profileId] = {
       xvfb,
       fluxbox,
       chrome,
       vnc,
-      vncPort
+      ws,
+      display,
+      vncPort,
+      wsPort,
+      startedAt: new Date()
     };
 
+    // Retorna URL
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
+    const noVncUrl = `${protocol}://${host}/novnc/${profileId}`;
+
+    console.log(`✅ Sessão iniciada! URL: ${noVncUrl}\n`);
 
     return res.json({
       success: true,
-      url: `${protocol}://${host}/novnc/${profileId}`
+      profileId,
+      url: noVncUrl,
+      vncPort,
+      wsPort
     });
 
   } catch (err) {
-    console.error('❌ ERROR:', err);
-    res.status(500).json({ error: err.message });
+    console.error(`❌ Erro ao iniciar ${profileId}:`, err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// ================= STOP =================
+// ================= STOP SESSION =================
 app.post('/session/stop', async (req, res) => {
   const { profileId } = req.body;
-
   const s = sessions[profileId];
-  if (!s) return res.json({ success: true });
 
-  try { s.chrome.kill(); } catch {}
-  try { s.vnc.kill(); } catch {}
-  try { s.fluxbox.kill(); } catch {}
-  try { s.xvfb.kill(); } catch {}
+  if (!s) {
+    return res.json({ success: true });
+  }
+
+  console.log(`\n========== STOP ${profileId} ==========`);
+
+  try {
+    s.chrome?.kill();
+    s.vnc?.kill();
+    s.ws?.kill();
+    s.fluxbox?.kill();
+    s.xvfb?.kill();
+  } catch (e) {
+    console.error(`Erro ao matar processos:`, e.message);
+  }
 
   delete sessions[profileId];
+  console.log(`✅ Sessão encerrada\n`);
 
   res.json({ success: true });
 });
 
-// ================= NOVNC =================
+// ================= STATUS =================
+app.get('/session/:profileId/status', (req, res) => {
+  const { profileId } = req.params;
+  const s = sessions[profileId];
+
+  if (!s) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const uptime = new Date() - s.startedAt;
+
+  res.json({
+    success: true,
+    profileId,
+    active: true,
+    uptime: Math.floor(uptime / 1000),
+    ports: { vnc: s.vncPort, ws: s.wsPort }
+  });
+});
+
+// ================= NOVNC HTML PAGE =================
 app.get('/novnc/:profileId', (req, res) => {
   const { profileId } = req.params;
-  const session = sessions[profileId];
+  const s = sessions[profileId];
 
-  if (!session) {
-    return res.send('Sessão não encontrada');
+  if (!s) {
+    return res.status(404).send('Sessão não encontrada');
   }
 
   const host = req.headers.host;
+  const wsUrl = `wss://${host}/ws/${profileId}`;
 
   res.send(`
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Browser ${profileId}</title>
-  <style>
-    body { margin:0; background:#000; }
-  </style>
+  <link rel="stylesheet" href="/novnc/app/ui.css">
   <script type="module">
     import RFB from '/novnc/core/rfb.js';
 
     const rfb = new RFB(
-      document.body,
-      'wss://${host}/ws/${profileId}'
+      document.getElementById('screen'),
+      '${wsUrl}',
+      { credentials: { username: '', password: '' } }
     );
+
+    rfb.addEventListener('connect', () => {
+      console.log('✅ Conectado ao VNC');
+      document.body.style.overflow = 'hidden';
+    });
+
+    rfb.addEventListener('disconnect', () => {
+      console.log('❌ Desconectado do VNC');
+    });
+
+    rfb.addEventListener('error', (e) => {
+      console.error('❌ Erro VNC:', e.detail);
+    });
 
     rfb.scaleViewport = true;
     rfb.resizeSession = true;
   </script>
+  <style>
+    body { margin: 0; padding: 0; background: #000; overflow: hidden; font-family: sans-serif; }
+    #screen { width: 100vw; height: 100vh; display: block; }
+    .status { position: fixed; bottom: 10px; right: 10px; color: #0f0; font-size: 12px; font-family: monospace; }
+  </style>
 </head>
-<body></body>
+<body>
+  <div id="screen"></div>
+  <div class="status">Conectando...</div>
+</body>
 </html>
   `);
 });
@@ -181,60 +265,28 @@ app.get('/novnc/:profileId', (req, res) => {
 app.use('/novnc', express.static('/usr/share/novnc'));
 
 // ================= HEALTH =================
-app.get('/health', (req, res) => res.send('OK'));
-
-// ================= WS TUNNEL =================
-const server = http.createServer(app);
-
-server.on('upgrade', (req, socket, head) => {
-  const match = req.url.match(/^\/ws\/([^/?]+)/);
-
-  if (!match) {
-    socket.destroy();
-    return;
-  }
-
-  const profileId = match[1];
-  const session = sessions[profileId];
-
-  if (!session) {
-    console.error(`[WS] Sessão não encontrada: ${profileId}`);
-    socket.writeHead(404);
-    socket.end();
-    return;
-  }
-
-  console.log(`[WS] Conectando ${profileId} para VNC porta ${session.vncPort}`);
-
-  const target = net.createConnection(session.vncPort, '127.0.0.1', () => {
-    console.log(`[WS] VNC conectado! Upgrading protocol...`);
-    socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\n' +
-      'Upgrade: websocket\r\n' +
-      'Connection: Upgrade\r\n' +
-      'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n' +
-      '\r\n'
-    );
-
-    target.write(head);
-    target.pipe(socket);
-    socket.pipe(target);
-  });
-
-  target.on('error', (err) => {
-    console.error(`[WS] Erro VNC:`, err.message);
-    socket.writeHead(500);
-    socket.end('Connection error');
-  });
-  socket.on('error', (err) => {
-    console.error(`[WS] Erro socket:`, err.message);
-    target.destroy();
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    activeSessions: Object.keys(sessions).length,
+    timestamp: new Date().toISOString()
   });
 });
 
-// ================= START =================
+// ================= START SERVER =================
 const PORT = process.env.PORT || 3000;
+const server = http.createServer(app);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Server rodando na porta', PORT);
+  console.log(`\n🚀 ProfileVault Server rodando na porta ${PORT}`);
+  console.log(`📍 Railway URL: ${process.env.RAILWAY_URL || 'http://localhost:3000'}\n`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('\n⚠️  SIGTERM recebido, encerrando sessões...');
+  Object.values(sessions).forEach(s => {
+    try { s.xvfb?.kill(); s.chrome?.kill(); s.vnc?.kill(); s.ws?.kill(); s.fluxbox?.kill(); } catch {}
+  });
+  server.close(() => process.exit(0));
 });
