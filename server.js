@@ -12,6 +12,15 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
+// ================= LOG GLOBAL =================
+process.on('uncaughtException', (err) => {
+  console.error('ERRO GLOBAL:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('PROMISE NÃO TRATADA:', err);
+});
+
 // ================= AUTH =================
 function auth(req, res, next) {
   const key = req.headers['x-service-secret'];
@@ -26,12 +35,10 @@ function parseProxy(proxyRaw, proxyType) {
   if (!proxyRaw) return null;
 
   const parts = proxyRaw.split(':');
-  let scheme = proxyType === 'socks5' ? 'socks5' : 'http';
+  const scheme = proxyType === 'socks5' ? 'socks5' : 'http';
 
   if (parts.length === 2) {
-    return {
-      server: `${scheme}://${parts[0]}:${parts[1]}`
-    };
+    return { server: `${scheme}://${parts[0]}:${parts[1]}` };
   }
 
   if (parts.length === 4) {
@@ -49,82 +56,65 @@ function parseProxy(proxyRaw, proxyType) {
 app.post('/session/start', auth, async (req, res) => {
   const { profileId, proxyRaw, proxyType } = req.body;
 
-  if (!profileId) {
-    return res.status(400).json({ error: 'profileId required' });
-  }
+  console.log('==== START REQUEST ====');
+  console.log(req.body);
 
   try {
-    // mata sessão antiga
+    const proxy = parseProxy(proxyRaw, proxyType);
+    console.log('Proxy:', proxy);
+
+    // kill sessão antiga
     if (sessions[profileId]) {
+      console.log('Matando sessão antiga...');
       try { await sessions[profileId].browser.close(); } catch {}
       delete sessions[profileId];
     }
 
-    const proxy = parseProxy(proxyRaw, proxyType);
-
-    console.log('=== INICIANDO ===');
-    console.log('Proxy:', proxy);
+    console.log('Iniciando browser...');
 
     const browser = await chromium.launch({
-      headless: true, // 🔥 IMPORTANTE (teste real)
+      headless: true,
       timeout: 60000,
       proxy: proxy || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--ignore-certificate-errors',
-        '--ignore-certificate-errors-spki-list'
+        '--ignore-certificate-errors'
       ]
     });
+
+    console.log('Browser OK');
 
     const context = await browser.newContext({
       ignoreHTTPSErrors: true
     });
 
+    console.log('Context OK');
+
     const page = await context.newPage();
 
-    // teste básico
+    console.log('Page OK');
+
     await page.goto('http://example.com', {
       timeout: 60000,
-      waitUntil: 'domcontentloaded'
+      waitUntil: 'commit'
     });
 
-    console.log('Página abriu');
-
-    // teste IP
-    try {
-      const resp = await page.goto('http://api.ipify.org?format=json');
-      const body = await resp.text();
-      console.log('IP:', body);
-    } catch (e) {
-      console.log('Erro IP:', e.message);
-    }
+    console.log('Navigation OK');
 
     sessions[profileId] = { browser };
 
     res.json({ success: true });
 
   } catch (error) {
-    console.error('ERRO REAL:', error);
+    console.error('🔥 ERRO REAL:', error);
 
     res.status(500).json({
-      error: error.message
+      error: error.message,
+      stack: error.stack
     });
   }
-});
-
-// ================= STOP =================
-app.post('/session/stop', auth, async (req, res) => {
-  const { profileId } = req.body;
-
-  if (sessions[profileId]) {
-    try { await sessions[profileId].browser.close(); } catch {}
-    delete sessions[profileId];
-  }
-
-  res.json({ success: true });
 });
 
 // ================= HEALTH =================
