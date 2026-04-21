@@ -5,7 +5,8 @@ const express = require('express');
 const { spawn } = require('child_process');
 const cors = require('cors');
 const crypto = require('crypto');
-const path = require('path');
+const http = require('http');
+const net = require('net');
 
 const app = express();
 app.use(express.json());
@@ -41,14 +42,17 @@ app.post('/session/start', async (req, res) => {
     if (!profileId) throw new Error('profileId obrigatório');
 
     if (sessions[profileId]) {
-      return res.json({ success: true });
+      return res.json({
+        success: true,
+        url: `/novnc/${profileId}`
+      });
     }
 
     const { display, vncPort, wsPort } = getPorts(profileId);
 
-    console.log('🚀 START', profileId);
+    console.log('🚀 START SESSION:', profileId);
 
-    // 1. Xvfb (display virtual)
+    // 1. Xvfb
     const xvfb = spawn('Xvfb', [
       `:${display}`,
       '-screen',
@@ -59,7 +63,7 @@ app.post('/session/start', async (req, res) => {
 
     await new Promise(r => setTimeout(r, 1500));
 
-    // 2. Fluxbox (window manager)
+    // 2. Window manager
     const fluxbox = spawn('fluxbox', [], {
       env: { ...process.env, DISPLAY: `:${display}` }
     });
@@ -80,39 +84,65 @@ app.post('/session/start', async (req, res) => {
     const vnc = spawn('x11vnc', [
       '-display', `:${display}`,
       '-forever',
-      '-nopw',
-      '-rfbport', String(vncPort)
+      '-shared',
+      '-rfbport', String(vncPort),
+      '-nopw'
     ]);
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1500));
 
-    // 5. noVNC (web)
+    // 5. WebSocket proxy interno
     const ws = spawn('websockify', [
-      '--web', '/usr/share/novnc',
       String(wsPort),
       `localhost:${vncPort}`
     ]);
 
-    sessions[profileId] = { xvfb, fluxbox, chrome, vnc, ws };
-
-    const host = req.headers.host;
-    const url = `https://${host}/novnc/${profileId}`;
+    sessions[profileId] = {
+      xvfb,
+      fluxbox,
+      chrome,
+      vnc,
+      ws,
+      wsPort
+    };
 
     res.json({
       success: true,
-      url
+      url: `/novnc/${profileId}`
     });
 
   } catch (err) {
-    console.error(err);
+    console.error('❌ ERROR:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ================= NOVNC PAGE =================
+// ================= STOP =================
+app.post('/session/stop', async (req, res) => {
+  const { profileId } = req.body;
+
+  const s = sessions[profileId];
+  if (!s) return res.json({ success: true });
+
+  try { s.chrome.kill(); } catch {}
+  try { s.vnc.kill(); } catch {}
+  try { s.ws.kill(); } catch {}
+  try { s.fluxbox.kill(); } catch {}
+  try { s.xvfb.kill(); } catch {}
+
+  delete sessions[profileId];
+
+  res.json({ success: true });
+});
+
+// ================= NOVNC UI =================
 app.get('/novnc/:profileId', (req, res) => {
   const { profileId } = req.params;
-  const { wsPort } = getPorts(profileId);
+  const session = sessions[profileId];
+
+  if (!session) {
+    return res.send('Sessão não encontrada');
+  }
 
   const host = req.headers.host;
 
@@ -120,12 +150,24 @@ app.get('/novnc/:profileId', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <title>Browser ${profileId}</title>
-  <script src="/novnc/vnc.html"></script>
+  <style>
+    body { margin:0; background:#000; }
+  </style>
+  <script type="module">
+    import RFB from '/novnc/core/rfb.js';
+
+    const rfb = new RFB(
+      document.body,
+      'wss://${host}/ws/${profileId}'
+    );
+
+    rfb.scaleViewport = true;
+    rfb.resizeSession = true;
+  </script>
 </head>
-<body style="margin:0">
-  <iframe src="/vnc.html?host=${host}&port=${wsPort}" width="100%" height="100%"></iframe>
-</body>
+<body></body>
 </html>
   `);
 });
@@ -134,11 +176,48 @@ app.get('/novnc/:profileId', (req, res) => {
 app.use('/novnc', express.static('/usr/share/novnc'));
 
 // ================= HEALTH =================
-app.get('/health', (req, res) => res.send('OK'));
+app.get('/health', (req, res) => {
+  res.send('OK');
+});
+
+// ================= WS TUNNEL (CRÍTICO) =================
+const server = http.createServer(app);
+
+server.on('upgrade', (req, socket, head) => {
+  const match = req.url.match(/^\/ws\/([^/?]+)/);
+
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  const profileId = match[1];
+  const session = sessions[profileId];
+
+  if (!session) {
+    socket.destroy();
+    return;
+  }
+
+  const target = net.createConnection(session.wsPort, '127.0.0.1', () => {
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n\r\n'
+    );
+
+    target.write(head);
+    target.pipe(socket);
+    socket.pipe(target);
+  });
+
+  target.on('error', () => socket.destroy());
+  socket.on('error', () => target.destroy());
+});
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log('🚀 Server rodando', PORT);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('🚀 Server rodando na porta', PORT);
 });
