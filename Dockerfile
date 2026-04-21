@@ -1,10 +1,9 @@
-# Usar imagem oficial do Playwright que já tem Chromium + dependências
-FROM mcr.microsoft.com/playwright:v1.50.0-noble
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Instalar noVNC, x11vnc, xvfb, websockify
 RUN apt-get update && apt-get install -y \
+    chromium \
     x11vnc \
     xvfb \
     novnc \
@@ -12,10 +11,10 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
 COPY package.json ./
 RUN npm install
-# Instalar browsers do Playwright
-RUN npx playwright install chromium
 
 COPY server.js ./
 
