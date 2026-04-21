@@ -66,7 +66,7 @@ app.post('/session/start', auth, async (req, res) => {
     console.log('Proxy:', proxy);
 
     const browser = await chromium.launch({
-      headless: false, // 🔥 IMPORTANTE (teste real)
+      headless: true, // 🔥 IMPORTANTE (teste real)
       timeout: 60000,
       proxy: proxy || undefined,
       args: [
