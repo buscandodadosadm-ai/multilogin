@@ -52,25 +52,26 @@ function parseProxy(proxyRaw, proxyType) {
   return null;
 }
 
-// ================= START =================
+// ================= START SESSION =================
 app.post('/session/start', auth, async (req, res) => {
   const { profileId, proxyRaw, proxyType } = req.body;
 
-  console.log('==== START REQUEST ====');
+  console.log('==== START SESSION ====');
   console.log(req.body);
+
+  if (!profileId) {
+    return res.status(400).json({ error: 'profileId required' });
+  }
 
   try {
     const proxy = parseProxy(proxyRaw, proxyType);
     console.log('Proxy:', proxy);
 
-    // kill sessão antiga
+    // encerra sessão existente
     if (sessions[profileId]) {
-      console.log('Matando sessão antiga...');
       try { await sessions[profileId].browser.close(); } catch {}
       delete sessions[profileId];
     }
-
-    console.log('Iniciando browser...');
 
     const browser = await chromium.launch({
       headless: true,
@@ -84,47 +85,61 @@ app.post('/session/start', auth, async (req, res) => {
       ]
     });
 
-    console.log('Browser OK');
-
     const context = await browser.newContext({
       ignoreHTTPSErrors: true
     });
 
-    console.log('Context OK');
-
     const page = await context.newPage();
-
-    console.log('Page OK');
 
     await page.goto('http://example.com', {
       timeout: 60000,
       waitUntil: 'commit'
     });
 
-    console.log('Navigation OK');
+    console.log('Navegação OK');
+
+    // teste IP
+    try {
+      const resp = await page.goto('http://api.ipify.org?format=json');
+      const body = await resp.text();
+      console.log('IP:', body);
+    } catch (e) {
+      console.log('Erro ao validar IP:', e.message);
+    }
 
     sessions[profileId] = { browser };
 
-    res.json({ success: true });
+    res.json({ success: true, profileId });
 
   } catch (error) {
-    console.error('🔥 ERRO REAL:', error);
+    console.error('ERRO AO INICIAR:', error);
 
     res.status(500).json({
-      error: error.message,
-      stack: error.stack
+      error: error.message
     });
   }
 });
 
-// ================= HEALTH =================
-app.get('/health', (req, res) => {
-  res.send('OK');
+// ================= STOP =================
+app.post('/session/stop', auth, async (req, res) => {
+  const { profileId } = req.body;
+
+  if (sessions[profileId]) {
+    try { await sessions[profileId].browser.close(); } catch {}
+    delete sessions[profileId];
+  }
+
+  res.json({ success: true });
 });
 
-// ================= START =================
+// ================= HEALTH =================
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// ================= START SERVER =================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor rodando...');
+  console.log('Servidor rodando na porta', PORT);
 });
