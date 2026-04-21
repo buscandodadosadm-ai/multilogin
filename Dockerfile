@@ -2,7 +2,7 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Instalar dependências do Playwright
+# Instalar dependências do sistema
 RUN apt-get update && apt-get install -y \
     wget \
     ca-certificates \
@@ -20,12 +20,17 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
-# Instalar browsers do Playwright
-RUN npx playwright install --with-deps
-
+# Copia package primeiro (cache melhor)
 COPY package.json ./
+COPY package-lock.json ./
+
+# Instala dependências (inclui Playwright)
 RUN npm install
 
+# Agora instala os browsers do Playwright (CORRETO)
+RUN npx playwright install --with-deps
+
+# Copia restante do projeto
 COPY . .
 
 EXPOSE 3000
