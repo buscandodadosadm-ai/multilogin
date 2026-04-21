@@ -4,9 +4,6 @@
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -15,6 +12,7 @@ app.use(cors());
 const SECRET = process.env.SERVICE_SECRET;
 const sessions = {};
 
+// ================= AUTH =================
 function auth(req, res, next) {
   const key = req.headers['x-service-secret'];
   if (!SECRET || key !== SECRET) {
@@ -23,19 +21,24 @@ function auth(req, res, next) {
   next();
 }
 
-// ================= PROXY =================
-function parseProxy(proxyRaw) {
+// ================= PROXY (HTTP + SOCKS5) =================
+function parseProxy(proxyRaw, proxyType) {
   if (!proxyRaw) return null;
 
   const parts = proxyRaw.split(':');
 
+  let scheme = 'http';
+  if (proxyType === 'socks5') scheme = 'socks5';
+
   if (parts.length === 2) {
-    return { server: `http://${parts[0]}:${parts[1]}` };
+    return {
+      server: `${scheme}://${parts[0]}:${parts[1]}`
+    };
   }
 
   if (parts.length === 4) {
     return {
-      server: `http://${parts[0]}:${parts[1]}`,
+      server: `${scheme}://${parts[0]}:${parts[1]}`,
       username: parts[2],
       password: parts[3]
     };
@@ -49,6 +52,7 @@ app.post('/session/start', auth, async (req, res) => {
   const {
     profileId,
     proxyRaw,
+    proxyType,
     userAgent,
     cookies,
     timezone,
@@ -64,7 +68,11 @@ app.post('/session/start', auth, async (req, res) => {
   }
 
   try {
-    const proxy = parseProxy(proxyRaw);
+    const proxy = parseProxy(proxyRaw, proxyType);
+
+    console.log('==== NOVA SESSÃO ====');
+    console.log('Perfil:', profileId);
+    console.log('Proxy:', proxy);
 
     const browser = await chromium.launch({
       headless: true
@@ -80,12 +88,32 @@ app.post('/session/start', auth, async (req, res) => {
 
     // ================= COOKIES =================
     if (cookies && Array.isArray(cookies)) {
-      await context.addCookies(cookies);
+      try {
+        await context.addCookies(cookies);
+        console.log('Cookies aplicados');
+      } catch (e) {
+        console.log('Erro ao aplicar cookies:', e.message);
+      }
     }
 
     const page = await context.newPage();
 
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' });
+    // ================= TESTE DE CONEXÃO =================
+    await page.goto('http://example.com', {
+      timeout: 60000,
+      waitUntil: 'commit'
+    });
+
+    // ================= TESTE DE IP =================
+    try {
+      const ipCheck = await page.goto('http://api.ipify.org?format=json', {
+        timeout: 30000
+      });
+      const body = await ipCheck.text();
+      console.log('IP do proxy:', body);
+    } catch (e) {
+      console.log('Falha ao validar proxy:', e.message);
+    }
 
     sessions[profileId] = {
       browser,
@@ -101,6 +129,7 @@ app.post('/session/start', auth, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Erro ao iniciar sessão:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
