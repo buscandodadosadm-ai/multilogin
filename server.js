@@ -109,7 +109,40 @@ app.post('/session/start', async (req, res) => {
     vnc.stdout?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
     vnc.stderr?.on('data', d => console.log(`[x11vnc]`, d.toString().slice(0, 80)));
 
-    await new Promise(r => setTimeout(r, 2000));
+    // Esperar x11vnc estar pronto
+    await new Promise(r => setTimeout(r, 4000));
+
+    // Verificar se x11vnc está escutando
+    console.log(`[5] Verificando se VNC está escutando na porta ${vncPort}...`);
+    const net = require('net');
+    let vncReady = false;
+    for (let i = 0; i < 10; i++) {
+      const socket = net.createConnection({
+        host: 'localhost',
+        port: vncPort,
+        timeout: 1000
+      });
+      try {
+        await new Promise((resolve) => {
+          socket.on('connect', () => {
+            console.log(`[5] ✅ VNC está pronto na porta ${vncPort}`);
+            vncReady = true;
+            socket.destroy();
+            resolve();
+          });
+          socket.on('error', () => {
+            socket.destroy();
+            resolve();
+          });
+        });
+        if (vncReady) break;
+      } catch (e) {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (!vncReady) {
+      console.error(`[5] ❌ VNC não respondeu depois de 10 tentativas`);
+    }
 
     // 5. websockify (WebSocket → RFB proxy)
     console.log(`[5] Iniciando websockify na porta ${wsPort}...`);
@@ -122,7 +155,7 @@ app.post('/session/start', async (req, res) => {
     ws.stdout?.on('data', d => console.log(`[websockify]`, d.toString().trim()));
     ws.stderr?.on('data', d => console.log(`[websockify]`, d.toString().trim()));
 
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 2000));
 
     // Salva sessão
     sessions[profileId] = {
@@ -295,41 +328,68 @@ server.on('upgrade', (req, socket, head) => {
         return;
       }
 
-      console.log(`[WebSocket] Client conectado a ${profileId}`);
+      console.log(`[WebSocket] Client conectado a ${profileId}, tentando conectar ao VNC na porta ${s.vncPort}...`);
 
-      // Conectar ao x11vnc
-      const vncSocket = require('net').createConnection({
-        host: 'localhost',
-        port: s.vncPort
-      });
+      // Conectar ao x11vnc (com retry)
+      let vncSocket;
+      const maxRetries = 3;
+      let retryCount = 0;
 
-      vncSocket.on('data', (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
+      const connectVNC = () => {
+        vncSocket = require('net').createConnection({
+          host: 'localhost',
+          port: s.vncPort,
+          timeout: 5000
+        });
+
+        vncSocket.on('connect', () => {
+          console.log(`[VNC Socket] Conectado com sucesso a ${s.vncPort}`);
+        });
+
+        vncSocket.on('data', (data) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+          }
+        });
+
+        vncSocket.on('error', (err) => {
+          console.error(`[VNC Socket] erro:`, err.message, `(tentativa ${retryCount + 1}/${maxRetries})`);
+          if (retryCount < maxRetries) {
+            retryCount++;
+            console.log(`[VNC Socket] Tentando reconectar em 1s...`);
+            setTimeout(connectVNC, 1000);
+          } else {
+            ws.close(1011, `VNC connection error after ${maxRetries} retries: ${err.message}`);
+          }
+        });
+
+        vncSocket.on('close', () => {
+          console.log(`[VNC Socket] Fechado`);
+          ws.close(1000);
+        });
+
+        vncSocket.on('timeout', () => {
+          console.error(`[VNC Socket] timeout na porta ${s.vncPort}`);
+          vncSocket.destroy();
+        });
+      };
+
+      connectVNC();
+
+      ws.on('message', (data) => {
+        if (vncSocket && vncSocket.writable) {
+          vncSocket.write(data);
         }
       });
 
-      vncSocket.on('error', (err) => {
-        console.error(`[VNC Socket] erro:`, err.message);
-        ws.close(1011, 'VNC connection error');
-      });
-
-      vncSocket.on('close', () => {
-        ws.close(1000);
-      });
-
-      ws.on('message', (data) => {
-        vncSocket.write(data);
-      });
-
       ws.on('close', () => {
-        vncSocket.destroy();
+        if (vncSocket) vncSocket.destroy();
         console.log(`[WebSocket] Client desconectado de ${profileId}`);
       });
 
       ws.on('error', (err) => {
         console.error(`[WebSocket] erro:`, err.message);
-        vncSocket.destroy();
+        if (vncSocket) vncSocket.destroy();
       });
     });
   }
