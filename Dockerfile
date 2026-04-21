@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y \
 
 COPY package.json ./
 RUN npm install
+# Instalar browsers do Playwright
+RUN npx playwright install chromium
 
 COPY server.js ./
 
